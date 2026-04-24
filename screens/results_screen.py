@@ -29,15 +29,15 @@ class ResultsScreen(Screen):
         # Renk
         if acc >= 75:
             color = c('success')
-            emoji = '🎉'
+            emoji = 'COK IYI'
             msg = 'Harika iş!'
         elif acc >= 50:
             color = c('warning')
-            emoji = '👍'
+            emoji = 'IYI'
             msg = 'İyi gidiyorsunuz!'
         else:
             color = c('error')
-            emoji = '💪'
+            emoji = 'DEVAM'
             msg = 'Pratik yapın!'
         
         self.result_emoji.text = emoji
@@ -58,7 +58,7 @@ class ResultsScreen(Screen):
             for joint, count in joint_errors.items():
                 row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8))
                 row.add_widget(Label(
-                    text=f'⚠ {joint}',
+                    text=f'Hata: {joint}',
                     font_size=dp(13),
                     color=c('warning'),
                     halign='left',
@@ -72,7 +72,7 @@ class ResultsScreen(Screen):
                 self.errors_container.add_widget(row)
         else:
             self.errors_container.add_widget(Label(
-                text='✓ Eklem hatası yok — mükemmel!',
+                text='Eklem hatasi yok, cok iyi.',
                 font_size=dp(13),
                 color=c('success'),
                 size_hint_y=None,
@@ -107,8 +107,8 @@ class ResultsScreen(Screen):
         
         # Büyük skor
         self.result_emoji = Label(
-            text='🎉',
-            font_size=dp(56),
+            text='SONUC',
+            font_size=dp(34),
             size_hint_y=None,
             height=dp(70),
         )

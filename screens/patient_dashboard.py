@@ -45,6 +45,16 @@ DEMO_EXERCISES = [
         'status': 'pending',
         'description': 'Kalça eklem hareketliliği için',
     },
+    {
+        'id': 4,
+        'name': 'Biceps Curl Test',
+        'daily_reps': 12,
+        'schedule': 'Test Seansi',
+        'status': 'pending',
+        'description': 'Dirsek acisina gore tekrar sayimi',
+        'mode': 'biceps',
+        'side': 'auto',
+    },
 ]
 
 DEMO_STATS = {
@@ -84,7 +94,7 @@ class PatientDashboard(Screen):
         logout_btn = Button(
             text='Çıkış',
             font_size=dp(12),
-            color=c('text_sub'),
+            color=c('button_text'),
             background_color=(0, 0, 0, 0),
             size_hint_x=None,
             width=dp(60),

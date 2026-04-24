@@ -17,18 +17,19 @@ from kivy.uix.progressbar import ProgressBar
 
 # ─── RENK PALETİ ─────────────────────────────────────────────────────────────
 COLORS = {
-    'bg_dark':     '#0F1923',
-    'bg_card':     '#1A2533',
-    'bg_surface':  '#1E2D40',
-    'primary':     '#00D4FF',
-    'primary_dim': '#0099BB',
-    'success':     '#00FF88',
-    'warning':     '#FFB800',
+    'bg_dark':     '#050805',
+    'bg_card':     '#0B120B',
+    'bg_surface':  '#101910',
+    'primary':     '#1F8F3A',
+    'primary_dim': '#176B2C',
+    'success':     '#35B85A',
+    'warning':     '#6E8F2A',
     'error':       '#FF4444',
     'text_main':   '#FFFFFF',
-    'text_sub':    '#8899AA',
-    'text_dim':    '#445566',
-    'border':      '#2A3F55',
+    'text_sub':    '#98AC98',
+    'text_dim':    '#5E715E',
+    'border':      '#223122',
+    'button_text': '#FF9F1A',
 }
 
 
@@ -46,7 +47,7 @@ class GlowButton(Button):
         self.text = text
         self.accent = accent_color or get_color_from_hex(COLORS['primary'])
         self.background_color = (0, 0, 0, 0)
-        self.color = get_color_from_hex(COLORS['text_main'])
+        self.color = get_color_from_hex(COLORS['button_text'])
         self.font_size = dp(15)
         self.bold = True
         self.size_hint_y = None
@@ -77,12 +78,12 @@ class GlowButton(Button):
 class SolidButton(Button):
     """Düz dolgulu buton"""
     
-    def __init__(self, text='', color_hex='#00D4FF', **kwargs):
+    def __init__(self, text='', color_hex='#1F8F3A', **kwargs):
         super().__init__(**kwargs)
         self.text = text
         self.fill_color = get_color_from_hex(color_hex)
         self.background_color = (0, 0, 0, 0)
-        self.color = get_color_from_hex('#0F1923')
+        self.color = get_color_from_hex(COLORS['button_text'])
         self.font_size = dp(15)
         self.bold = True
         self.size_hint_y = None
@@ -142,8 +143,10 @@ class ExerciseCard(Card):
             Color(*get_color_from_hex(COLORS['primary']), 0.15)
             RoundedRectangle(pos=icon_box.pos, size=icon_box.size, radius=[dp(10)])
         icon_label = Label(
-            text='🏃',
-            font_size=dp(28),
+            text='EX',
+            font_size=dp(20),
+            bold=True,
+            color=c('primary'),
         )
         icon_box.add_widget(icon_label)
         
@@ -183,9 +186,9 @@ class ExerciseCard(Card):
             'skipped':   COLORS['error'],
         }
         status_texts = {
-            'completed': '✓ Tamamlandı',
-            'pending':   '⏳ Bekliyor',
-            'skipped':   '✗ Atlandı',
+            'completed': 'Tamamlandi',
+            'pending':   'Bekliyor',
+            'skipped':   'Atlandi',
         }
         
         status_lbl = Label(
@@ -312,7 +315,7 @@ class FeedbackPanel(Card):
         title.bind(size=lambda w, s: setattr(w, 'text_size', (s[0], None)))
         
         self.msg_label = Label(
-            text='✓ Hareketi bekleniyor...',
+            text='Hareket bekleniyor...',
             font_size=dp(13),
             color=c('text_main'),
             halign='left',
@@ -327,10 +330,10 @@ class FeedbackPanel(Card):
     
     def update(self, feedback_list):
         if not feedback_list:
-            self.msg_label.text = '✓ Hareketi doğru yapıyorsunuz!'
+            self.msg_label.text = 'Hareketi dogru yapiyorsunuz.'
             self.msg_label.color = c('success')
         else:
-            msgs = '\n'.join([f'⚠ {f}' for f in feedback_list[:3]])
+            msgs = '\n'.join([f'Hata: {f}' for f in feedback_list[:3]])
             self.msg_label.text = msgs
             self.msg_label.color = c('warning')
 
@@ -359,7 +362,7 @@ class TopBar(BoxLayout):
             back_btn = Button(
                 text='‹',
                 font_size=dp(28),
-                color=c('primary'),
+                color=c('button_text'),
                 background_color=(0, 0, 0, 0),
                 size_hint_x=None,
                 width=dp(44),

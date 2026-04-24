@@ -20,7 +20,7 @@ from screens.exercise_list import ExerciseListScreen
 from screens.exercise_session import ExerciseSessionScreen
 from screens.results_screen import ResultsScreen
 
-Window.clearcolor = get_color_from_hex('#0F1923')
+Window.clearcolor = get_color_from_hex('#050805')
 
 
 class PhysioApp(App):

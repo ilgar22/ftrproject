@@ -6,6 +6,7 @@ En kritik ekran: pose estimation ve karşılaştırma burada çalışır
 import cv2
 import numpy as np
 import threading
+import os
 from datetime import datetime
 
 from kivy.uix.screenmanager import Screen
@@ -28,6 +29,10 @@ from widgets.components import (
 from services.pose_engine import PoseEngine
 from services.api_service import api
 
+DROIDCAM_IP = "192.168.50.139:4747"
+DROIDCAM_URL = f"http://{DROIDCAM_IP}"
+DROIDCAM_ALT_URL = f"http://{DROIDCAM_IP}/mjpegfeed"
+
 
 class ExerciseSessionScreen(Screen):
     
@@ -40,6 +45,8 @@ class ExerciseSessionScreen(Screen):
         self.session_start_time = None
         self.target_reps = 10
         self._clock_event = None
+        self._green_frame_count = 0
+        self._using_droidcam = False
         self._build()
     
     # ─── YÜKLEME ─────────────────────────────────────────────────────────────
@@ -48,6 +55,7 @@ class ExerciseSessionScreen(Screen):
         self.exercise = exercise_data
         self.target_reps = exercise_data.get('daily_reps', 10)
         self.pose_engine.reset_session()
+        self._configure_exercise_mode(exercise_data)
         
         # Ekran başlığını güncelle
         self.title_label.text = exercise_data.get('name', 'Egzersiz')
@@ -57,19 +65,90 @@ class ExerciseSessionScreen(Screen):
         
         # Referans pose verilerini API'den çek
         ex_id = exercise_data.get('id')
-        if ex_id:
+        if self.pose_engine.exercise_mode == 'reference' and ex_id:
             api.get_exercise_pose_data(ex_id, self._on_pose_data_loaded)
+        elif self.pose_engine.exercise_mode == 'biceps':
+            self.status_label.text = 'Biceps sayaci hazir'
+            self.status_label.color = c('success')
+
+    def _configure_exercise_mode(self, exercise_data):
+        name = (exercise_data.get('name') or '').lower()
+        mode = (exercise_data.get('mode') or '').lower()
+        if 'biceps' in name or mode == 'biceps':
+            side = exercise_data.get('side', 'auto')
+            self.pose_engine.set_exercise_mode('biceps', side=side)
+        else:
+            self.pose_engine.set_exercise_mode('reference')
     
     def _on_pose_data_loaded(self, success, data):
         def update(dt):
             if success and data:
                 self.pose_engine.load_reference_from_json(data)
-                self.status_label.text = 'Referans yüklendi ✓'
+                self.status_label.text = 'Referans yuklendi'
                 self.status_label.color = c('success')
             else:
-                self.status_label.text = '⚠ Demo modu (referans yok)'
+                self.status_label.text = 'Referans video indiriliyor...'
                 self.status_label.color = c('warning')
+                self._load_reference_from_video()
         Clock.schedule_once(update, 0)
+
+    def _load_reference_from_video(self):
+        ex_id = self.exercise.get('id') if self.exercise else None
+        if not ex_id:
+            self.status_label.text = 'Demo modu (egzersiz kimligi yok)'
+            self.status_label.color = c('warning')
+            return
+
+        def on_video_downloaded(success, local_path):
+            if not success or not local_path:
+                Clock.schedule_once(
+                    lambda dt: self._set_status('Demo modu (referans bulunamadi)', 'warning'),
+                    0
+                )
+                return
+
+            thread = threading.Thread(
+                target=self._extract_reference_worker,
+                args=(local_path,),
+                daemon=True
+            )
+            thread.start()
+
+        api.download_exercise_video(ex_id, on_video_downloaded)
+
+    def _extract_reference_worker(self, local_video_path):
+        Clock.schedule_once(
+            lambda dt: self._set_status('Referans video analiz ediliyor...', 'warning'),
+            0
+        )
+        try:
+            sequence = self.pose_engine.extract_reference_from_video(local_video_path)
+            if sequence:
+                Clock.schedule_once(
+                    lambda dt: self._set_status(f'Referans hazir ({len(sequence)} frame)', 'success'),
+                    0
+                )
+            else:
+                Clock.schedule_once(
+                    lambda dt: self._set_status('Referans cikarilamadi, demo modu', 'warning'),
+                    0
+                )
+        except Exception:
+            Clock.schedule_once(
+                lambda dt: self._set_status('Referans analiz hatasi, demo modu', 'warning'),
+
+                0
+            )
+        finally:
+            try:
+                if os.path.exists(local_video_path):
+                    os.remove(local_video_path)
+            except OSError:
+                pass
+
+    def _set_status(self, text, color_key='text_sub'):
+        self.status_label.text = text
+        self.status_label.color = c(color_key)
     
     # ─── EKRAN YAPISI ─────────────────────────────────────────────────────────
     def _build(self):
@@ -144,8 +223,9 @@ class ExerciseSessionScreen(Screen):
         
         # Kamera feed
         self.cam_image = Image(
-            allow_stretch=True,
-            keep_ratio=True,
+            size_hint=(1, 1),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            fit_mode='contain',
         )
         cam_container.add_widget(self.cam_image)
         
@@ -214,7 +294,7 @@ class ExerciseSessionScreen(Screen):
         )
         
         self.start_btn = SolidButton(
-            text='▶  Başlat',
+            text='Baslat',
             color_hex=COLORS['success'],
         )
         self.start_btn.bind(on_press=self._toggle_session)
@@ -241,7 +321,7 @@ class ExerciseSessionScreen(Screen):
     def _start_session(self):
         self.is_running = True
         self.session_start_time = datetime.now()
-        self.start_btn.text = '⏸  Duraklat'
+        self.start_btn.text = 'Duraklat'
         self.finish_btn.opacity = 1.0
         self.finish_btn.disabled = False
         self.status_label.text = 'Egzersiz yapılıyor...'
@@ -249,13 +329,18 @@ class ExerciseSessionScreen(Screen):
         
         # Kamerayı başlat
         self._open_camera()
+        if self.camera is None:
+            self.is_running = False
+            self.start_btn.text = 'Baslat'
+            self._set_status('Kamera baglantisi kurulamadi', 'error')
+            return
         
         # Clock ile frame güncelleme
         self._clock_event = Clock.schedule_interval(self._update_frame, 1/25)
     
     def _pause_session(self):
         self.is_running = False
-        self.start_btn.text = '▶  Devam'
+        self.start_btn.text = 'Devam'
         self.status_label.text = 'Duraklatıldı'
         self.status_label.color = c('warning')
         
@@ -292,15 +377,49 @@ class ExerciseSessionScreen(Screen):
     
     # ─── KAMERA & POSE ───────────────────────────────────────────────────────
     def _open_camera(self):
-        if self.camera is None:
-            self.camera = cv2.VideoCapture(0)
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if self.camera is not None:
+            return
+
+        candidates = [
+            (DROIDCAM_URL, cv2.CAP_FFMPEG, True),
+            (DROIDCAM_ALT_URL, cv2.CAP_FFMPEG, True),
+            (f"http://{DROIDCAM_IP}/videofeed", cv2.CAP_FFMPEG, True),
+            (DROIDCAM_URL, cv2.CAP_ANY, True),
+            (DROIDCAM_ALT_URL, cv2.CAP_ANY, True),
+            (0, cv2.CAP_DSHOW, False),
+            (0, cv2.CAP_ANY, False),
+        ]
+
+        for source, backend, is_droidcam in candidates:
+            cap = cv2.VideoCapture(source, backend)
+            if not cap or not cap.isOpened():
+                if cap:
+                    cap.release()
+                continue
+
+            ok = False
+            for _ in range(10):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    ok = True
+                    break
+            if not ok:
+                cap.release()
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.camera = cap
+            self._using_droidcam = is_droidcam
+            self._green_frame_count = 0
+            return
     
     def _close_camera(self):
         if self.camera:
             self.camera.release()
             self.camera = None
+        self._green_frame_count = 0
+        self._using_droidcam = False
     
     def _update_frame(self, dt):
         if not self.is_running or self.camera is None:
@@ -308,9 +427,23 @@ class ExerciseSessionScreen(Screen):
         
         ret, frame = self.camera.read()
         if not ret:
+            self._set_status('Kare alinamadi, kamerayi kontrol edin', 'warning')
             return
+
+        # Detect common DroidCam decode issue (solid green frames) and auto-fallback.
+        if self._is_likely_green_frame(frame):
+            self._green_frame_count += 1
+            if self._green_frame_count > 12 and self._using_droidcam:
+                self._set_status('DroidCam goruntu sorunu, yerel kameraya geciliyor', 'warning')
+                self._close_camera()
+                self.camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                self._using_droidcam = False
+            return
+        self._green_frame_count = 0
         
-        # Aynalama (selfie view)
+        # Portrait orientation: rotate frame by -90 degrees (clockwise).
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        # Selfie mirror
         frame = cv2.flip(frame, 1)
         
         # Pose analizi
@@ -327,7 +460,7 @@ class ExerciseSessionScreen(Screen):
         
         # Hedef tamamlandı mı?
         if rep_count >= self.target_reps:
-            self.status_label.text = f'🎉 {self.target_reps} tekrar tamamlandı!'
+            self.status_label.text = f'{self.target_reps} tekrar tamamlandi'
             self.status_label.color = c('success')
     
     def _frame_to_texture(self, frame_bgr):
@@ -342,6 +475,13 @@ class ExerciseSessionScreen(Screen):
         )
         texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
         self.cam_image.texture = texture
+
+    def _is_likely_green_frame(self, frame):
+        if frame is None or len(frame.shape) != 3 or frame.shape[2] < 3:
+            return False
+        mean_bgr = frame.mean(axis=(0, 1))
+        b, g, r = float(mean_bgr[0]), float(mean_bgr[1]), float(mean_bgr[2])
+        return g > 90 and g > (r * 1.8) and g > (b * 1.8)
     
     # ─── NAVİGASYON ──────────────────────────────────────────────────────────
     def _go_back(self):

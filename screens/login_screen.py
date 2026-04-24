@@ -138,6 +138,8 @@ class LoginScreen(Screen):
             multiline=False,
             size_hint_y=None,
             height=dp(50),
+            background_normal='',
+            background_active='',
             background_color=get_color_from_hex(COLORS['bg_surface']),
             foreground_color=get_color_from_hex(COLORS['text_main']),
             hint_text_color=get_color_from_hex(COLORS['text_dim']),

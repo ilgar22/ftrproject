@@ -9,6 +9,7 @@ import cv2
 import json
 import urllib.request
 import os
+from types import SimpleNamespace
 from collections import deque
 
 
@@ -129,7 +130,7 @@ class PoseEngine:
         self._landmarker     = None
         self._last_landmarks = None
         self.frame_count     = 0
-        self.skip_frames     = 2
+        self.skip_frames     = 1
         self.reference_sequence  = []
         self.ref_index           = 0
         self.rep_count           = 0
@@ -141,7 +142,21 @@ class PoseEngine:
         self.current_feedback    = []
         self.error_history       = deque(maxlen=100)
         self.joint_error_counts  = {j: 0 for j in JOINT_ANGLES}
+        self.exercise_mode       = 'reference'
+        self.biceps_side         = 'auto'
+        self.biceps_up_angle     = 65
+        self.biceps_down_angle   = 145
+        self._biceps_state       = 'down'
+        self._video_ts_ms        = 0
+        self._smooth_alpha       = 0.65
+        self._no_detection_streak = 0
+        self._max_hold_frames     = 6
         self._init_landmarker()
+
+    def set_exercise_mode(self, mode='reference', side='auto'):
+        self.exercise_mode = mode or 'reference'
+        self.biceps_side = side or 'auto'
+        self._biceps_state = 'down'
 
     def _init_landmarker(self):
         if not _ensure_model():
@@ -149,7 +164,7 @@ class PoseEngine:
         try:
             opts = PoseLandmarkerOpts(
                 base_options=BaseOptions(model_asset_path=MODEL_PATH),
-                running_mode=RunningMode.IMAGE,
+                running_mode=RunningMode.VIDEO,
                 num_poses=1,
                 min_pose_detection_confidence=0.55,
                 min_pose_presence_confidence=0.55,
@@ -200,12 +215,27 @@ class PoseEngine:
         try:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_image = MPImage(image_format=MPImageFormat.SRGB, data=rgb)
-            result = self._landmarker.detect(mp_image)
+            self._video_ts_ms += 33
+            result = self._landmarker.detect_for_video(mp_image, self._video_ts_ms)
             if result.pose_landmarks and len(result.pose_landmarks) > 0:
-                return result.pose_landmarks[0]
+                return self._smooth_landmarks(result.pose_landmarks[0])
         except Exception as e:
             print(f"[PoseEngine] Tespit hatasi: {e}")
         return None
+
+    def _smooth_landmarks(self, landmarks):
+        if self._last_landmarks is None:
+            return landmarks
+
+        smoothed = []
+        for cur, prev in zip(landmarks, self._last_landmarks):
+            smoothed.append(SimpleNamespace(
+                x=(self._smooth_alpha * cur.x) + ((1.0 - self._smooth_alpha) * prev.x),
+                y=(self._smooth_alpha * cur.y) + ((1.0 - self._smooth_alpha) * prev.y),
+                z=(self._smooth_alpha * getattr(cur, 'z', 0.0)) + ((1.0 - self._smooth_alpha) * getattr(prev, 'z', 0.0)),
+                visibility=(self._smooth_alpha * getattr(cur, 'visibility', 1.0)) + ((1.0 - self._smooth_alpha) * getattr(prev, 'visibility', 1.0)),
+            ))
+        return smoothed
 
     def process_frame(self, frame_bgr):
         self.frame_count += 1
@@ -216,20 +246,74 @@ class PoseEngine:
 
         landmarks = self._detect_landmarks(frame_bgr)
         if landmarks is None:
-            self.current_feedback = ["Lutfen kameranin karsisinda durun"]
-            return annotated, 0.0, self.current_feedback, self.rep_count, {}
+            self._no_detection_streak += 1
+            if self._last_landmarks is not None and self._no_detection_streak <= self._max_hold_frames:
+                landmarks = self._last_landmarks
+            else:
+                self.current_feedback = ["Lutfen kameranin karsisinda durun"]
+                return annotated, 0.0, self.current_feedback, self.rep_count, {}
+        else:
+            self._no_detection_streak = 0
 
         self._last_landmarks = landmarks
         current_angles = extract_angles(landmarks)
         similarity, feedback, joint_status = 0.0, [], {}
 
-        if self.reference_sequence and current_angles:
+        if self.exercise_mode == 'biceps' and current_angles:
+            similarity, feedback, joint_status = self._process_biceps(current_angles)
+        elif self.reference_sequence and current_angles:
             similarity, feedback, joint_status = self._compare_with_reference(current_angles)
             self._update_rep_counter(similarity, feedback)
 
         self._draw_skeleton(annotated, landmarks, joint_status, frame_bgr.shape[:2])
         self.current_feedback = feedback
         return annotated, similarity, feedback, self.rep_count, joint_status
+
+    def _process_biceps(self, current_angles):
+        left = current_angles.get('sol_dirsek')
+        right = current_angles.get('sag_dirsek')
+
+        if left is None and right is None:
+            return 0.0, ['Dirsek gorunmuyor, kameraya yaklasin'], {}
+
+        if self.biceps_side == 'left':
+            active = left
+            side_key = 'sol_dirsek'
+        elif self.biceps_side == 'right':
+            active = right
+            side_key = 'sag_dirsek'
+        else:
+            if left is not None and right is not None:
+                active = min(left, right)
+                side_key = 'sol_dirsek' if left <= right else 'sag_dirsek'
+            elif left is not None:
+                active, side_key = left, 'sol_dirsek'
+            else:
+                active, side_key = right, 'sag_dirsek'
+
+        similarity = float(np.clip((180.0 - active) / 120.0, 0.0, 1.0))
+        feedback = []
+        joint_status = {side_key: 'ok'}
+
+        if self._biceps_state == 'down' and active <= self.biceps_up_angle:
+            self._biceps_state = 'up'
+            feedback.append('Yukari pozisyon algilandi')
+        elif self._biceps_state == 'up' and active >= self.biceps_down_angle:
+            self._biceps_state = 'down'
+            self.total_reps += 1
+            self.correct_reps += 1
+            self.rep_count += 1
+            self.error_history.append({
+                'rep': self.total_reps, 'correct': True, 'errors': []
+            })
+            feedback.append(f'Tekrar sayildi: {self.rep_count}')
+        else:
+            if active > self.biceps_up_angle and self._biceps_state == 'down':
+                feedback.append('Dirsegi daha fazla bukun')
+            elif active < self.biceps_down_angle and self._biceps_state == 'up':
+                feedback.append('Kolu kontrollu sekilde asagi indirin')
+
+        return similarity, feedback, joint_status
 
     def _compare_with_reference(self, current_angles):
         best_score, best_ref = 0.0, {}
@@ -305,6 +389,9 @@ class PoseEngine:
     def reset_session(self):
         self.rep_count = self.total_reps = self.correct_reps = self.frame_count = 0
         self.rep_state = 'rest'
+        self._biceps_state = 'down'
+        self._video_ts_ms = 0
+        self._no_detection_streak = 0
         self.ref_index = 0
         self.current_feedback = []
         self.error_history.clear()
