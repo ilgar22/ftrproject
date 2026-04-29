@@ -11,10 +11,21 @@ import tempfile
 from kivy.app import App
 
 
-# =============================================
-# BURAYA KENDİ REPLİT URL'İNİ YAZ
-BASE_URL = "https://your-replit-app.replit.app/api"
-# =============================================
+def _normalize_base_url(raw_url):
+    raw = (raw_url or "").strip().rstrip("/")
+    if not raw:
+        return "https://your-replit-app.replit.app/api"
+    if raw.endswith("/api"):
+        return raw
+    return f"{raw}/api"
+
+
+# Replit entegrasyonu icin:
+# - PHYSIO_API_BASE_URL varsa onu kullanir
+# - yoksa asagidaki varsayilan adres devreye girer
+BASE_URL = _normalize_base_url(
+    os.getenv("PHYSIO_API_BASE_URL", "https://your-replit-app.replit.app/api")
+)
 
 
 class APIService:
@@ -37,6 +48,24 @@ class APIService:
         if self.token:
             headers['Authorization'] = f'Bearer {self.token}'
         return headers
+
+    def test_connection(self, callback):
+        """Replit backend baglantisini test et - callback(success, message)"""
+        def _run():
+            try:
+                r = requests.get(
+                    f"{BASE_URL}/health",
+                    headers=self._get_headers(),
+                    timeout=8
+                )
+                if r.status_code == 200:
+                    callback(True, f"Baglanti basarili: {BASE_URL}")
+                else:
+                    callback(False, f"Baglanti var ama health={r.status_code}")
+            except Exception as e:
+                callback(False, f"Baglanti hatasi: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _is_assigned_to_user(self, assigned_patient_id, user_id):
         """Hasta atamasini id tip farklarina ragmen guvenli karsilastir."""

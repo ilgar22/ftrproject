@@ -58,7 +58,19 @@ buildozer android debug
 
 ## 🔌 Replit API Entegrasyonu
 
-`services/api_service.py` dosyasındaki `BASE_URL`'i kendi Replit URL'inle değiştir.
+Uygulama backend adresini ortam değişkeninden okur:
+
+- `PHYSIO_API_BASE_URL=https://YOUR-APP.replit.app`
+- Uygulama bunu otomatik olarak `.../api` formatına çevirir.
+
+Windows PowerShell örneği:
+
+```powershell
+$env:PHYSIO_API_BASE_URL="https://YOUR-APP.replit.app"
+python main.py
+```
+
+Alternatif olarak `services/api_service.py` içindeki varsayılan URL'i doğrudan değiştirebilirsin.
 
 Uygulama şu endpoint'leri bekler:
 

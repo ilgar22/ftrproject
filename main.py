@@ -5,6 +5,7 @@ Kivy + MediaPipe ile geliştirilmiş hasta egzersiz takip sistemi
 
 import os
 os.environ['KIVY_NO_ENV_CONFIG'] = '1'
+os.environ['PHYSIO_API_BASE_URL']
 
 from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, SlideTransition
