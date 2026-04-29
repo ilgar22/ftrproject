@@ -37,6 +37,41 @@ class APIService:
         if self.token:
             headers['Authorization'] = f'Bearer {self.token}'
         return headers
+
+    def _is_assigned_to_user(self, assigned_patient_id, user_id):
+        """Hasta atamasini id tip farklarina ragmen guvenli karsilastir."""
+        if assigned_patient_id is None:
+            return True
+        if user_id is None:
+            return False
+        if assigned_patient_id == user_id:
+            return True
+        return str(assigned_patient_id) == str(user_id)
+
+    def _is_exercise_visible_for_current_user(self, exercise):
+        """
+        Hasta tarafinda atamayi id ve isim uzerinden eslestir.
+        Bazi ortamlarda id tip/format farki oldugundan isim fallback'i gerekir.
+        """
+        if not self.user:
+            return True
+        if self.user.get('role') != 'patient':
+            return True
+        # Demo modunda (lokal atama testi) hasta tum lokal atamalari gorebilsin.
+        if isinstance(self.token, str) and self.token.startswith('demo_token'):
+            return True
+
+        assigned_id = exercise.get('assigned_patient_id')
+        user_id = self.user.get('id')
+        if self._is_assigned_to_user(assigned_id, user_id):
+            return True
+
+        assigned_name = (exercise.get('assigned_patient_name') or '').strip().lower()
+        user_name = (self.user.get('name') or '').strip().lower()
+        if assigned_name and user_name and assigned_name == user_name:
+            return True
+
+        return False
     
     # ─── AUTH ────────────────────────────────────────────────
     def login(self, email, password, callback):
@@ -72,10 +107,9 @@ class APIService:
             if self.local_exercises:
                 items = list(self.local_exercises)
                 if self.user and self.user.get('role') == 'patient':
-                    uid = self.user.get('id')
                     items = [
                         ex for ex in items
-                        if ex.get('assigned_patient_id') in (None, uid)
+                        if self._is_exercise_visible_for_current_user(ex)
                     ]
                 callback(True, items)
                 return
@@ -90,19 +124,17 @@ class APIService:
                 else:
                     fallback = list(self.local_exercises)
                     if self.user and self.user.get('role') == 'patient':
-                        uid = self.user.get('id')
                         fallback = [
                             ex for ex in fallback
-                            if ex.get('assigned_patient_id') in (None, uid)
+                            if self._is_exercise_visible_for_current_user(ex)
                         ]
                     callback(False, fallback)
             except Exception:
                 fallback = list(self.local_exercises)
                 if self.user and self.user.get('role') == 'patient':
-                    uid = self.user.get('id')
                     fallback = [
                         ex for ex in fallback
-                        if ex.get('assigned_patient_id') in (None, uid)
+                        if self._is_exercise_visible_for_current_user(ex)
                     ]
                 callback(False, fallback)
         
@@ -129,6 +161,33 @@ class APIService:
     def get_exercise_video_url(self, exercise_id):
         """Egzersiz video URL'ini döndür"""
         return f"{BASE_URL}/exercises/{exercise_id}/video"
+
+    def get_exercise_video_source(self, exercise_id, callback):
+        """
+        Egzersiz videosu kaynagini dondurur.
+        callback(success, source_path_or_url, is_temp_file)
+        """
+        def _run():
+            try:
+                ex_id = int(exercise_id)
+            except Exception:
+                callback(False, None, False)
+                return
+
+            local_path = self.local_video_paths.get(ex_id)
+            if local_path and os.path.exists(local_path):
+                callback(True, local_path, False)
+                return
+
+            def _on_downloaded(success, downloaded_path):
+                if success and downloaded_path:
+                    callback(True, downloaded_path, True)
+                else:
+                    callback(False, None, False)
+
+            self.download_exercise_video(ex_id, _on_downloaded)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def download_exercise_video(self, exercise_id, callback):
         """Egzersiz referans videosunu indir - callback(success, local_path)"""

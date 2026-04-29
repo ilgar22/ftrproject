@@ -199,7 +199,7 @@ class PatientDashboard(Screen):
     def _on_exercises_loaded(self, success, data):
         def update(dt):
             self.exercise_container.clear_widgets()
-            exercises = data if success and data else DEMO_EXERCISES
+            exercises = data if success else DEMO_EXERCISES
             
             if not exercises:
                 self.exercise_container.add_widget(Label(

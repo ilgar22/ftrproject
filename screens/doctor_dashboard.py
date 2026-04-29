@@ -556,10 +556,28 @@ class DoctorDashboard(Screen):
 
     def _process_video_upload(self, name, reps, schedule, video_path, patient_id, patient_name):
         engine = PoseEngine()
-        pose_sequence = engine.extract_reference_from_video(video_path)
+        Clock.schedule_once(lambda *_: self._set_upload_status(
+            'Adim 1/5: Video alindi, offline analiz baslatildi', 'warning'
+        ), 0)
+
+        def on_progress(progress, frame_idx=0, total_frames=0):
+            pct = int(progress * 100)
+            if pct < 20:
+                step = 'Adim 2/5: Karelerden pose landmark cikariliyor'
+            elif pct < 45:
+                step = 'Adim 3/5: Eklem acilari hesaplanıyor'
+            elif pct < 70:
+                step = 'Adim 4/5: Normalize trajektori olusturuluyor'
+            else:
+                step = 'Adim 5/5: Zamansal referans model kuruluyor'
+            detail = f"{step} ({frame_idx}/{total_frames})" if total_frames else step
+            Clock.schedule_once(lambda *_: self._set_upload_status(detail, 'warning'), 0)
+
+        pose_sequence = engine.extract_reference_from_video(video_path, callback_progress=on_progress)
         engine.release()
 
-        if not pose_sequence:
+        frames = pose_sequence.get('frames', []) if isinstance(pose_sequence, dict) else (pose_sequence or [])
+        if not frames:
             Clock.schedule_once(lambda *_: self._set_upload_status(
                 'Video analizi basarisiz: pose verisi bulunamadi', 'error'
             ), 0)
@@ -573,6 +591,9 @@ class DoctorDashboard(Screen):
             'assigned_patient_id': patient_id,
             'assigned_patient_name': patient_name,
         }
+        Clock.schedule_once(lambda *_: self._set_upload_status(
+            'Referans model hazir, hastaya ataniyor...', 'warning'
+        ), 0)
         api.create_exercise_from_video(payload, pose_sequence, video_path, self._on_exercise_created)
 
     def _on_exercise_created(self, success, data):

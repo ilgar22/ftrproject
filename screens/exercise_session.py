@@ -15,6 +15,7 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.image import Image
+from kivy.uix.popup import Popup
 from kivy.graphics.texture import Texture
 from kivy.graphics import Color, RoundedRectangle, Rectangle
 from kivy.utils import get_color_from_hex
@@ -47,6 +48,14 @@ class ExerciseSessionScreen(Screen):
         self._clock_event = None
         self._green_frame_count = 0
         self._using_droidcam = False
+        self._doctor_video_source = None
+        self._doctor_video_is_temp = False
+        self._doctor_preview_cap = None
+        self._doctor_preview_event = None
+        self._doctor_preview_popup = None
+        self._doctor_preview_image = None
+        self._doctor_helper_cap = None
+        self._doctor_helper_event = None
         self._build()
     
     # ─── YÜKLEME ─────────────────────────────────────────────────────────────
@@ -56,6 +65,8 @@ class ExerciseSessionScreen(Screen):
         self.target_reps = exercise_data.get('daily_reps', 10)
         self.pose_engine.reset_session()
         self._configure_exercise_mode(exercise_data)
+        self._doctor_video_source = None
+        self._doctor_video_is_temp = False
         
         # Ekran başlığını güncelle
         self.title_label.text = exercise_data.get('name', 'Egzersiz')
@@ -70,6 +81,30 @@ class ExerciseSessionScreen(Screen):
         elif self.pose_engine.exercise_mode == 'biceps':
             self.status_label.text = 'Biceps sayaci hazir'
             self.status_label.color = c('success')
+        self._prepare_doctor_video_source()
+
+    def _prepare_doctor_video_source(self):
+        ex_id = self.exercise.get('id') if self.exercise else None
+        if not ex_id:
+            return
+
+        def on_video_source(success, source, is_temp):
+            def update(_):
+                if success and source:
+                    self._doctor_video_source = source
+                    self._doctor_video_is_temp = bool(is_temp)
+                    self.watch_doctor_btn.disabled = False
+                    self.watch_doctor_btn.opacity = 1.0
+                    self.helper_hint_label.text = 'Yardimci: Doktor videosunu takip edin'
+                    if self.is_running:
+                        self._start_doctor_helper_preview()
+                else:
+                    self.watch_doctor_btn.disabled = True
+                    self.watch_doctor_btn.opacity = 0.45
+                    self.helper_hint_label.text = 'Yardimci: Ornek video hazir degil'
+            Clock.schedule_once(update, 0)
+
+        api.get_exercise_video_source(ex_id, on_video_source)
 
     def _configure_exercise_mode(self, exercise_data):
         name = (exercise_data.get('name') or '').lower()
@@ -124,8 +159,9 @@ class ExerciseSessionScreen(Screen):
         try:
             sequence = self.pose_engine.extract_reference_from_video(local_video_path)
             if sequence:
+                frame_count = len(sequence.get('frames', [])) if isinstance(sequence, dict) else len(sequence)
                 Clock.schedule_once(
-                    lambda dt: self._set_status(f'Referans hazir ({len(sequence)} frame)', 'success'),
+                    lambda dt: self._set_status(f'Referans hazir ({frame_count} frame)', 'success'),
                     0
                 )
             else:
@@ -260,6 +296,51 @@ class ExerciseSessionScreen(Screen):
         rep_overlay.add_widget(self.rep_label)
         rep_overlay.add_widget(self.target_label)
         cam_container.add_widget(rep_overlay)
+
+        helper_overlay = BoxLayout(
+            orientation='vertical',
+            spacing=dp(4),
+            size_hint=(None, None),
+            size=(dp(220), dp(250)),
+            pos_hint={'x': 0.02, 'top': 0.98},
+            padding=dp(6),
+        )
+        with helper_overlay.canvas.before:
+            Color(0, 0, 0, 0.60)
+            self._helper_bg = RoundedRectangle(
+                pos=helper_overlay.pos, size=helper_overlay.size, radius=[dp(10)]
+            )
+        helper_overlay.bind(
+            pos=lambda *a: setattr(self._helper_bg, 'pos', helper_overlay.pos),
+            size=lambda *a: setattr(self._helper_bg, 'size', helper_overlay.size),
+        )
+        helper_title = Label(
+            text='Yardimci',
+            font_size=dp(12),
+            bold=True,
+            color=c('text_main'),
+            size_hint_y=None,
+            height=dp(18),
+        )
+        self.helper_image = Image(
+            size_hint=(1, None),
+            height=dp(175),
+            fit_mode='contain',
+        )
+        self.helper_hint_label = Label(
+            text='Yardimci: Ornek video bekleniyor',
+            font_size=dp(10),
+            color=c('text_sub'),
+            halign='left',
+            valign='top',
+        )
+        self.helper_hint_label.bind(
+            size=lambda w, s: setattr(w, 'text_size', (s[0], None))
+        )
+        helper_overlay.add_widget(helper_title)
+        helper_overlay.add_widget(self.helper_image)
+        helper_overlay.add_widget(self.helper_hint_label)
+        cam_container.add_widget(helper_overlay)
         
         body.add_widget(cam_container)
         
@@ -280,6 +361,28 @@ class ExerciseSessionScreen(Screen):
         sim_card.add_widget(self.similarity_meter)
         
         metrics_row.add_widget(sim_card)
+        
+        steps_card = Card(orientation='vertical', spacing=dp(4))
+        steps_title = Label(
+            text='Canli Islem Adimlari',
+            font_size=dp(11),
+            color=c('text_sub'),
+            size_hint_y=None,
+            height=dp(16),
+        )
+        self.pipeline_label = Label(
+            text='Baslatinca adimlar burada gorunecek',
+            font_size=dp(10),
+            color=c('text_main'),
+            halign='left',
+            valign='top',
+        )
+        self.pipeline_label.bind(
+            size=lambda w, s: setattr(w, 'text_size', (s[0], None))
+        )
+        steps_card.add_widget(steps_title)
+        steps_card.add_widget(self.pipeline_label)
+        metrics_row.add_widget(steps_card)
         body.add_widget(metrics_row)
         
         # Geri bildirim paneli
@@ -303,8 +406,14 @@ class ExerciseSessionScreen(Screen):
         self.finish_btn.bind(on_press=self._finish_session)
         self.finish_btn.opacity = 0.4
         self.finish_btn.disabled = True
+
+        self.watch_doctor_btn = GlowButton(text='Doktor Ornek Videosu')
+        self.watch_doctor_btn.bind(on_press=self._open_doctor_video_popup)
+        self.watch_doctor_btn.disabled = True
+        self.watch_doctor_btn.opacity = 0.45
         
         controls.add_widget(self.start_btn)
+        controls.add_widget(self.watch_doctor_btn)
         controls.add_widget(self.finish_btn)
         body.add_widget(controls)
         
@@ -337,6 +446,7 @@ class ExerciseSessionScreen(Screen):
         
         # Clock ile frame güncelleme
         self._clock_event = Clock.schedule_interval(self._update_frame, 1/25)
+        self._start_doctor_helper_preview()
     
     def _pause_session(self):
         self.is_running = False
@@ -346,10 +456,12 @@ class ExerciseSessionScreen(Screen):
         
         if self._clock_event:
             self._clock_event.cancel()
+        self._close_doctor_helper_preview_stream()
     
     def _finish_session(self, *a):
         self._pause_session()
         self._close_camera()
+        self._close_doctor_helper_preview_stream()
         
         # Sonuçları kaydet ve sonuç ekranına geç
         summary = self.pose_engine.get_session_summary()
@@ -456,6 +568,15 @@ class ExerciseSessionScreen(Screen):
         # UI güncelle
         self.similarity_meter.update(similarity)
         self.feedback_panel.update(feedback)
+        live_steps = self.pose_engine.get_live_pipeline_steps()
+        if live_steps:
+            self.pipeline_label.text = '\n'.join(live_steps[-5:])
+        if feedback:
+            self.helper_hint_label.text = f'Yardimci ipucu: {feedback[0]}'
+            self.helper_hint_label.color = c('warning')
+        else:
+            self.helper_hint_label.text = 'Yardimci: Hareketi doktor videosu ile senkron yapin'
+            self.helper_hint_label.color = c('success')
         self.rep_label.text = str(rep_count)
         
         # Hedef tamamlandı mı?
@@ -476,6 +597,124 @@ class ExerciseSessionScreen(Screen):
         texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
         self.cam_image.texture = texture
 
+    def _open_doctor_video_popup(self, *_):
+        if not self._doctor_video_source:
+            self._set_status('Doktor videosu henuz hazir degil', 'warning')
+            return
+
+        root = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
+        self._doctor_preview_image = Image(
+            size_hint=(1, 1),
+            fit_mode='contain',
+        )
+        close_btn = SolidButton(text='Kapat', color_hex=COLORS['primary'])
+        popup = Popup(
+            title='Doktor Ornek Videosu',
+            content=root,
+            size_hint=(0.9, 0.85),
+        )
+        close_btn.bind(on_press=lambda *_: self._close_doctor_video_popup())
+        popup.bind(on_dismiss=lambda *_: self._close_doctor_video_popup())
+        root.add_widget(self._doctor_preview_image)
+        root.add_widget(close_btn)
+        self._doctor_preview_popup = popup
+        popup.open()
+        self._start_doctor_video_preview()
+
+    def _start_doctor_video_preview(self):
+        self._close_doctor_video_preview_stream()
+        try:
+            self._doctor_preview_cap = cv2.VideoCapture(self._doctor_video_source)
+            if not self._doctor_preview_cap or not self._doctor_preview_cap.isOpened():
+                self._set_status('Doktor videosu acilamadi (codec destegi yok olabilir)', 'error')
+                self._close_doctor_video_preview_stream()
+                return
+            self._doctor_preview_event = Clock.schedule_interval(self._update_doctor_video_preview, 1 / 25)
+        except Exception:
+            self._set_status('Doktor videosu oynatilirken hata olustu', 'error')
+            self._close_doctor_video_preview_stream()
+
+    def _update_doctor_video_preview(self, _dt):
+        if self._doctor_preview_cap is None or self._doctor_preview_image is None:
+            return
+
+        ret, frame = self._doctor_preview_cap.read()
+        if not ret or frame is None:
+            # Loop
+            self._doctor_preview_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._doctor_preview_cap.read()
+            if not ret or frame is None:
+                return
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_flip = cv2.flip(frame_rgb, 0)
+        buf = frame_flip.tobytes()
+        texture = Texture.create(
+            size=(frame.shape[1], frame.shape[0]),
+            colorfmt='rgb'
+        )
+        texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
+        self._doctor_preview_image.texture = texture
+
+    def _close_doctor_video_preview_stream(self):
+        if self._doctor_preview_event:
+            self._doctor_preview_event.cancel()
+            self._doctor_preview_event = None
+        if self._doctor_preview_cap:
+            self._doctor_preview_cap.release()
+            self._doctor_preview_cap = None
+
+    def _start_doctor_helper_preview(self):
+        if not self._doctor_video_source:
+            return
+        self._close_doctor_helper_preview_stream()
+        try:
+            self._doctor_helper_cap = cv2.VideoCapture(self._doctor_video_source)
+            if not self._doctor_helper_cap or not self._doctor_helper_cap.isOpened():
+                self.helper_hint_label.text = 'Yardimci: Ornek video acilamadi'
+                self.helper_hint_label.color = c('error')
+                self._close_doctor_helper_preview_stream()
+                return
+            self._doctor_helper_event = Clock.schedule_interval(self._update_doctor_helper_preview, 1 / 20)
+        except Exception:
+            self.helper_hint_label.text = 'Yardimci: Video baslatma hatasi'
+            self.helper_hint_label.color = c('error')
+            self._close_doctor_helper_preview_stream()
+
+    def _update_doctor_helper_preview(self, _dt):
+        if self._doctor_helper_cap is None or self.helper_image is None:
+            return
+        ret, frame = self._doctor_helper_cap.read()
+        if not ret or frame is None:
+            self._doctor_helper_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._doctor_helper_cap.read()
+            if not ret or frame is None:
+                return
+        frame = cv2.resize(frame, (320, 220))
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_flip = cv2.flip(frame_rgb, 0)
+        buf = frame_flip.tobytes()
+        texture = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt='rgb')
+        texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
+        self.helper_image.texture = texture
+
+    def _close_doctor_helper_preview_stream(self):
+        if self._doctor_helper_event:
+            self._doctor_helper_event.cancel()
+            self._doctor_helper_event = None
+        if self._doctor_helper_cap:
+            self._doctor_helper_cap.release()
+            self._doctor_helper_cap = None
+
+    def _close_doctor_video_popup(self):
+        self._close_doctor_video_preview_stream()
+        if self._doctor_preview_popup:
+            popup = self._doctor_preview_popup
+            self._doctor_preview_popup = None
+            if popup.parent:
+                popup.dismiss()
+        self._doctor_preview_image = None
+
     def _is_likely_green_frame(self, frame):
         if frame is None or len(frame.shape) != 3 or frame.shape[2] < 3:
             return False
@@ -488,15 +727,32 @@ class ExerciseSessionScreen(Screen):
         if self.is_running:
             self._pause_session()
         self._close_camera()
+        self._close_doctor_helper_preview_stream()
         App.get_running_app().switch_screen('patient_dashboard', direction='right')
     
     def cleanup(self):
         self._close_camera()
+        self._close_doctor_helper_preview_stream()
+        self._close_doctor_video_preview_stream()
         if self._clock_event:
             self._clock_event.cancel()
         self.pose_engine.release()
+        self._cleanup_temp_doctor_video()
     
     def on_leave(self):
         self._close_camera()
+        self._close_doctor_helper_preview_stream()
+        self._close_doctor_video_preview_stream()
         if self._clock_event:
             self._clock_event.cancel()
+        self._cleanup_temp_doctor_video()
+
+    def _cleanup_temp_doctor_video(self):
+        if self._doctor_video_source and self._doctor_video_is_temp:
+            try:
+                if os.path.exists(self._doctor_video_source):
+                    os.remove(self._doctor_video_source)
+            except OSError:
+                pass
+        self._doctor_video_source = None
+        self._doctor_video_is_temp = False
