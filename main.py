@@ -4,7 +4,8 @@ Kivy + MediaPipe ile geliştirilmiş hasta egzersiz takip sistemi
 """
 
 import os
-os.environ['KIVY_NO_ENV_CONFIG'] = '1'
+os.environ.setdefault('KIVY_NO_ENV_CONFIG', '1')
+os.environ.setdefault('PHYSIO_API_BASE_URL', 'https://replit.com/@2kekgames/Rehab-Coach')
 
 from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, SlideTransition
@@ -16,11 +17,12 @@ from kivy.clock import Clock
 from screens.login_screen import LoginScreen
 from screens.patient_dashboard import PatientDashboard
 from screens.doctor_dashboard import DoctorDashboard
+from screens.admin_dashboard import AdminDashboard
 from screens.exercise_list import ExerciseListScreen
 from screens.exercise_session import ExerciseSessionScreen
 from screens.results_screen import ResultsScreen
 
-Window.clearcolor = get_color_from_hex('#050805')
+Window.clearcolor = get_color_from_hex('#000000')
 
 
 class PhysioApp(App):
@@ -33,6 +35,7 @@ class PhysioApp(App):
             LoginScreen(name='login'),
             PatientDashboard(name='patient_dashboard'),
             DoctorDashboard(name='doctor_dashboard'),
+            AdminDashboard(name='admin_dashboard'),
             ExerciseListScreen(name='exercise_list'),
             ExerciseSessionScreen(name='exercise_session'),
             ResultsScreen(name='results'),
