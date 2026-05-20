@@ -14,7 +14,7 @@ from kivy.app import App
 def _normalize_base_url(raw_url):
     raw = (raw_url or "").strip().rstrip("/")
     if not raw:
-        return "https://your-replit-app.replit.app/api"
+        return "https://replit.com/@2kekgames/Rehab-Coach
     if raw.endswith("/api"):
         return raw
     return f"{raw}/api"
@@ -24,7 +24,7 @@ def _normalize_base_url(raw_url):
 # - PHYSIO_API_BASE_URL varsa onu kullanir
 # - yoksa asagidaki varsayilan adres devreye girer
 BASE_URL = _normalize_base_url(
-    os.getenv("PHYSIO_API_BASE_URL", "https://your-replit-app.replit.app/api")
+    os.getenv("PHYSIO_API_BASE_URL", "https://replit.com/@2kekgames/Rehab-Coach")
 )
 
 
