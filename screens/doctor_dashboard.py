@@ -2,21 +2,26 @@
 Doktor Paneli - Hasta listesi ve egzersiz takibi
 """
 
+import os
+import threading
+
+import cv2
 from kivy.uix.screenmanager import Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.button import Button
+from kivy.uix.image import Image
 from kivy.uix.textinput import TextInput
 from kivy.uix.popup import Popup
 from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.spinner import Spinner
 from kivy.graphics import Color, Rectangle, RoundedRectangle, Line
+from kivy.graphics.texture import Texture
 from kivy.utils import get_color_from_hex
 from kivy.metrics import dp
 from kivy.clock import Clock
 from kivy.app import App
-import threading
 
 from widgets.components import Card, TopBar, SolidButton, GlowButton, c, COLORS
 from services.api_service import api
@@ -31,6 +36,16 @@ DEMO_PATIENTS = [
     {'id': 3, 'name': 'Mehmet Kaya', 'age': 60,
      'exercises_today': 0, 'compliance': 45, 'last_active': '3 gün önce'},
 ]
+
+
+def _get_recording_path(assignment):
+    last_result = assignment.get('last_result') or {}
+    return (
+        assignment.get('patient_recording_path')
+        or last_result.get('patient_recording_path')
+        or assignment.get('recording_path')
+        or last_result.get('recording_path')
+    )
 
 
 class PatientCard(Card):
@@ -85,7 +100,7 @@ class PatientCard(Card):
         view_btn = Button(
             text='Detay ›',
             font_size=dp(13),
-            color=c('button_text'),
+            color=c('link'),
             background_color=(0, 0, 0, 0),
             size_hint_x=None,
             width=dp(70),
@@ -98,8 +113,10 @@ class PatientCard(Card):
 
 
 class AssignmentCard(Card):
-    def __init__(self, assignment, **kwargs):
-        super().__init__(orientation='vertical', spacing=dp(4), size_hint_y=None, height=dp(86), **kwargs)
+    def __init__(self, assignment, on_recording_cb=None, **kwargs):
+        has_recording = bool(_get_recording_path(assignment))
+        card_height = dp(128) if has_recording else dp(92)
+        super().__init__(orientation='vertical', spacing=dp(4), size_hint_y=None, height=card_height, **kwargs)
         ex_name = assignment.get('name', 'Egzersiz')
         patient_name = assignment.get('assigned_patient_name') or 'Hasta'
         status = assignment.get('status', 'pending')
@@ -140,6 +157,12 @@ class AssignmentCard(Card):
         self.add_widget(title)
         self.add_widget(details)
         self.add_widget(status_lbl)
+        if has_recording:
+            recording_btn = GlowButton(text='Hasta Kaydini Izle')
+            recording_btn.height = dp(34)
+            recording_btn.font_size = dp(12)
+            recording_btn.bind(on_press=lambda *_: on_recording_cb and on_recording_cb(assignment))
+            self.add_widget(recording_btn)
 
 
 class DoctorDashboard(Screen):
@@ -151,6 +174,10 @@ class DoctorDashboard(Screen):
         self._selected_patient_id = None
         self._selected_patient_name = ''
         self._patients = []
+        self._recording_cap = None
+        self._recording_event = None
+        self._recording_popup = None
+        self._recording_image = None
         self._build()
     
     def on_enter(self):
@@ -175,7 +202,7 @@ class DoctorDashboard(Screen):
         logout_btn = Button(
             text='Çıkış',
             font_size=dp(12),
-            color=c('button_text'),
+            color=c('link'),
             background_color=(0, 0, 0, 0),
             size_hint_x=None,
             width=dp(60),
@@ -360,7 +387,9 @@ class DoctorDashboard(Screen):
                     status_text = 'Tamamlandi' if status == 'completed' else 'Bekleniyor'
                     status_color = c('success') if status == 'completed' else c('warning')
 
-                    row = Card(orientation='vertical', spacing=dp(4), size_hint_y=None, height=dp(92))
+                    recording_path = _get_recording_path(ex)
+                    row_height = dp(132) if recording_path else dp(92)
+                    row = Card(orientation='vertical', spacing=dp(4), size_hint_y=None, height=row_height)
                     line1 = Label(
                         text=ex.get('name', 'Egzersiz'),
                         font_size=dp(14),
@@ -395,6 +424,12 @@ class DoctorDashboard(Screen):
                     row.add_widget(line1)
                     row.add_widget(line2)
                     row.add_widget(line3)
+                    if recording_path:
+                        watch_btn = GlowButton(text='Hasta Kaydini Izle')
+                        watch_btn.height = dp(34)
+                        watch_btn.font_size = dp(12)
+                        watch_btn.bind(on_press=lambda *_args, item=ex: self._open_patient_recording(item))
+                        row.add_widget(watch_btn)
                     list_box.add_widget(row)
 
             list_wrap.add_widget(list_box)
@@ -426,8 +461,80 @@ class DoctorDashboard(Screen):
                 ))
                 return
             for item in assignments:
-                self.assignments_box.add_widget(AssignmentCard(item))
+                self.assignments_box.add_widget(AssignmentCard(item, on_recording_cb=self._open_patient_recording))
         Clock.schedule_once(update, 0)
+
+    def _open_patient_recording(self, assignment):
+        recording_path = _get_recording_path(assignment)
+        if not recording_path:
+            self._set_upload_status('Hasta kaydi bulunamadi', 'warning')
+            return
+        if not recording_path.startswith('http') and not os.path.exists(recording_path):
+            self._set_upload_status('Hasta kaydi dosyasi bulunamadi', 'error')
+            return
+
+        root = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
+        self._recording_image = Image(size_hint=(1, 1), fit_mode='contain')
+        close_btn = SolidButton(text='Kapat', color_hex=COLORS['primary'])
+        popup = Popup(
+            title='Hasta Egzersiz Kaydi',
+            content=root,
+            size_hint=(0.9, 0.85),
+        )
+        close_btn.bind(on_press=lambda *_: self._close_patient_recording())
+        popup.bind(on_dismiss=lambda *_: self._close_patient_recording())
+        root.add_widget(self._recording_image)
+        root.add_widget(close_btn)
+        self._recording_popup = popup
+        popup.open()
+        self._start_patient_recording_preview(recording_path)
+
+    def _start_patient_recording_preview(self, recording_path):
+        self._close_recording_stream()
+        try:
+            self._recording_cap = cv2.VideoCapture(recording_path)
+            if not self._recording_cap or not self._recording_cap.isOpened():
+                self._set_upload_status('Hasta kaydi acilamadi', 'error')
+                self._close_recording_stream()
+                return
+            self._recording_event = Clock.schedule_interval(self._update_patient_recording_preview, 1 / 25)
+        except Exception:
+            self._set_upload_status('Hasta kaydi oynatilirken hata olustu', 'error')
+            self._close_recording_stream()
+
+    def _update_patient_recording_preview(self, _dt):
+        if self._recording_cap is None or self._recording_image is None:
+            return
+
+        ret, frame = self._recording_cap.read()
+        if not ret or frame is None:
+            self._recording_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._recording_cap.read()
+            if not ret or frame is None:
+                return
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_flip = cv2.flip(frame_rgb, 0)
+        texture = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt='rgb')
+        texture.blit_buffer(frame_flip.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
+        self._recording_image.texture = texture
+
+    def _close_recording_stream(self):
+        if self._recording_event:
+            self._recording_event.cancel()
+            self._recording_event = None
+        if self._recording_cap:
+            self._recording_cap.release()
+            self._recording_cap = None
+
+    def _close_patient_recording(self):
+        self._close_recording_stream()
+        if self._recording_popup:
+            popup = self._recording_popup
+            self._recording_popup = None
+            if popup.parent:
+                popup.dismiss()
+        self._recording_image = None
 
     def _open_upload_popup(self):
         root = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(10))
@@ -484,7 +591,7 @@ class DoctorDashboard(Screen):
         choose_btn = GlowButton(text='Video Dosyasi Sec')
         choose_btn.bind(on_press=lambda *_: self._choose_video_file(path_label))
 
-        submit_btn = SolidButton(text='Pose Hesapla ve Hastaya Ata', color_hex=COLORS['success'])
+        submit_btn = SolidButton(text='Pose Hesapla ve Hastaya Ata', color_hex=COLORS['primary'])
         submit_btn.bind(on_press=lambda *_: self._start_upload_flow(
             name_input.text.strip(),
             reps_input.text.strip(),

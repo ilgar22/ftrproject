@@ -25,20 +25,26 @@ class ResultsScreen(Screen):
     def show_results(self, summary):
         self.summary = summary
         acc = summary.get('accuracy_score', 0)
-        
-        # Renk
-        if acc >= 75:
+        passed = summary.get('session_passed', False)
+        target = summary.get('target_reps', 0)
+        correct = summary.get('correct_reps', 0)
+
+        if passed:
+            color = c('success')
+            emoji = 'BASARILI'
+            msg = f'Hedef tamamlandi ({correct}/{target})'
+        elif acc >= 75:
             color = c('success')
             emoji = 'COK IYI'
-            msg = 'Harika iş!'
+            msg = 'Harika is!'
         elif acc >= 50:
             color = c('warning')
             emoji = 'IYI'
-            msg = 'İyi gidiyorsunuz!'
+            msg = 'Iyi gidiyorsunuz'
         else:
             color = c('error')
             emoji = 'DEVAM'
-            msg = 'Pratik yapın!'
+            msg = 'Tekrar deneyin — hareketi doktor videosu ile eslestirin'
         
         self.result_emoji.text = emoji
         self.result_msg.text = msg

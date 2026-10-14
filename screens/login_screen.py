@@ -2,6 +2,7 @@
 Giriş Ekranı - Hasta ve Doktor girişi
 """
 
+from kivy.uix.widget import Widget
 from kivy.uix.screenmanager import Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
@@ -34,16 +35,27 @@ class LoginScreen(Screen):
             size=lambda *a: setattr(self._bg, 'size', root.size),
         )
         
-        # Logo ve başlık
-        root.add_widget(BoxLayout(size_hint_y=0.1))
-        
-        logo_label = Label(
-            text='🏥',
-            font_size=dp(64),
-            size_hint_y=None,
-            height=dp(80),
+        # Logo
+        logo_row = BoxLayout(size_hint_y=None, height=dp(72))
+        logo_box = BoxLayout(size_hint_x=None, width=dp(72))
+        with logo_box.canvas.before:
+            Color(*get_color_from_hex(COLORS['primary']))
+            self._logo_bg = RoundedRectangle(pos=logo_box.pos, size=logo_box.size, radius=[dp(18)])
+        logo_box.bind(
+            pos=lambda *a: setattr(self._logo_bg, 'pos', logo_box.pos),
+            size=lambda *a: setattr(self._logo_bg, 'size', logo_box.size),
         )
-        root.add_widget(logo_label)
+        logo_label = Label(
+            text='PC',
+            font_size=dp(28),
+            bold=True,
+            color=get_color_from_hex(COLORS['button_text']),
+        )
+        logo_box.add_widget(logo_label)
+        logo_row.add_widget(Widget(size_hint_x=1))
+        logo_row.add_widget(logo_box)
+        logo_row.add_widget(Widget(size_hint_x=1))
+        root.add_widget(logo_row)
         
         title = Label(
             text='PhysioConnect',
@@ -140,7 +152,7 @@ class LoginScreen(Screen):
             height=dp(50),
             background_normal='',
             background_active='',
-            background_color=get_color_from_hex(COLORS['bg_surface']),
+            background_color=get_color_from_hex(COLORS['bg_input']),
             foreground_color=get_color_from_hex(COLORS['text_main']),
             hint_text_color=get_color_from_hex(COLORS['text_dim']),
             cursor_color=get_color_from_hex(COLORS['primary']),

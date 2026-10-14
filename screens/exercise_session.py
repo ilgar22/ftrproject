@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import threading
 import os
+import tempfile
 from datetime import datetime
 
 from kivy.uix.screenmanager import Screen
@@ -27,7 +28,7 @@ from widgets.components import (
     Card, SolidButton, GlowButton, TopBar,
     SimilarityMeter, FeedbackPanel, c, COLORS
 )
-from services.pose_engine import PoseEngine
+from services.pose_engine import PoseEngine, COMPLETION_ACCURACY_MIN, preprocess_frame
 from services.api_service import api
 
 DROIDCAM_IP = "192.168.50.139:4747"
@@ -56,6 +57,10 @@ class ExerciseSessionScreen(Screen):
         self._doctor_preview_image = None
         self._doctor_helper_cap = None
         self._doctor_helper_event = None
+        self._recording_writer = None
+        self._recording_path = None
+        self._recording_size = None
+        self._reference_ready = False
         self._build()
     
     # ─── YÜKLEME ─────────────────────────────────────────────────────────────
@@ -64,9 +69,13 @@ class ExerciseSessionScreen(Screen):
         self.exercise = exercise_data
         self.target_reps = exercise_data.get('daily_reps', 10)
         self.pose_engine.reset_session()
-        self._configure_exercise_mode(exercise_data)
+        self._reference_ready = False
+        self.pose_engine.set_exercise_mode('reference')
         self._doctor_video_source = None
         self._doctor_video_is_temp = False
+        self._close_session_recording()
+        self._recording_path = None
+        self._recording_size = None
         
         # Ekran başlığını güncelle
         self.title_label.text = exercise_data.get('name', 'Egzersiz')
@@ -76,11 +85,8 @@ class ExerciseSessionScreen(Screen):
         
         # Referans pose verilerini API'den çek
         ex_id = exercise_data.get('id')
-        if self.pose_engine.exercise_mode == 'reference' and ex_id:
+        if ex_id:
             api.get_exercise_pose_data(ex_id, self._on_pose_data_loaded)
-        elif self.pose_engine.exercise_mode == 'biceps':
-            self.status_label.text = 'Biceps sayaci hazir'
-            self.status_label.color = c('success')
         self._prepare_doctor_video_source()
 
     def _prepare_doctor_video_source(self):
@@ -106,19 +112,12 @@ class ExerciseSessionScreen(Screen):
 
         api.get_exercise_video_source(ex_id, on_video_source)
 
-    def _configure_exercise_mode(self, exercise_data):
-        name = (exercise_data.get('name') or '').lower()
-        mode = (exercise_data.get('mode') or '').lower()
-        if 'biceps' in name or mode == 'biceps':
-            side = exercise_data.get('side', 'auto')
-            self.pose_engine.set_exercise_mode('biceps', side=side)
-        else:
-            self.pose_engine.set_exercise_mode('reference')
-    
     def _on_pose_data_loaded(self, success, data):
         def update(dt):
             if success and data:
+                self.pose_engine.set_exercise_mode('reference')
                 self.pose_engine.load_reference_from_json(data)
+                self._reference_ready = self.pose_engine.has_reference()
                 self.status_label.text = 'Referans yuklendi'
                 self.status_label.color = c('success')
             else:
@@ -137,7 +136,7 @@ class ExerciseSessionScreen(Screen):
         def on_video_downloaded(success, local_path):
             if not success or not local_path:
                 Clock.schedule_once(
-                    lambda dt: self._set_status('Demo modu (referans bulunamadi)', 'warning'),
+                    lambda dt: self._set_status('Referans videosu bulunamadi', 'error'),
                     0
                 )
                 return
@@ -156,31 +155,40 @@ class ExerciseSessionScreen(Screen):
             lambda dt: self._set_status('Referans video analiz ediliyor...', 'warning'),
             0
         )
+        worker = PoseEngine()
         try:
-            sequence = self.pose_engine.extract_reference_from_video(local_video_path)
-            if sequence:
-                frame_count = len(sequence.get('frames', [])) if isinstance(sequence, dict) else len(sequence)
-                Clock.schedule_once(
-                    lambda dt: self._set_status(f'Referans hazir ({frame_count} frame)', 'success'),
-                    0
-                )
-            else:
-                Clock.schedule_once(
-                    lambda dt: self._set_status('Referans cikarilamadi, demo modu', 'warning'),
-                    0
-                )
+            sequence = worker.extract_reference_from_video(local_video_path)
+            frames = sequence.get('frames', []) if isinstance(sequence, dict) else []
+            Clock.schedule_once(
+                lambda dt: self._apply_extracted_reference(sequence, len(frames)),
+                0
+            )
         except Exception:
             Clock.schedule_once(
-                lambda dt: self._set_status('Referans analiz hatasi, demo modu', 'warning'),
-
+                lambda dt: self._set_status('Referans analiz hatasi', 'error'),
                 0
             )
         finally:
+            worker.release()
             try:
                 if os.path.exists(local_video_path):
                     os.remove(local_video_path)
             except OSError:
                 pass
+
+    def _apply_extracted_reference(self, sequence, frame_count):
+        if sequence and frame_count >= 8:
+            self.pose_engine.load_reference_from_json(sequence)
+            self._set_reference_ready(frame_count)
+        else:
+            self._set_status('Referans cikarilamadi (yetersiz veri)', 'error')
+
+    def _set_reference_ready(self, frame_count):
+        self._reference_ready = self.pose_engine.has_reference()
+        if self._reference_ready:
+            self._set_status(f'Referans hazir ({frame_count} frame)', 'success')
+        else:
+            self._set_status('Referans cikarilamadi', 'error')
 
     def _set_status(self, text, color_key='text_sub'):
         self.status_label.text = text
@@ -398,7 +406,7 @@ class ExerciseSessionScreen(Screen):
         
         self.start_btn = SolidButton(
             text='Baslat',
-            color_hex=COLORS['success'],
+            color_hex=COLORS['primary'],
         )
         self.start_btn.bind(on_press=self._toggle_session)
         
@@ -428,6 +436,10 @@ class ExerciseSessionScreen(Screen):
             self._pause_session()
     
     def _start_session(self):
+        if not self.pose_engine.has_reference():
+            self._set_status('Referans yuklenmeden baslatilamaz', 'error')
+            return
+
         self.is_running = True
         self.session_start_time = datetime.now()
         self.start_btn.text = 'Duraklat'
@@ -445,6 +457,7 @@ class ExerciseSessionScreen(Screen):
             return
         
         # Clock ile frame güncelleme
+        self._prepare_session_recording()
         self._clock_event = Clock.schedule_interval(self._update_frame, 1/25)
         self._start_doctor_helper_preview()
     
@@ -462,6 +475,7 @@ class ExerciseSessionScreen(Screen):
         self._pause_session()
         self._close_camera()
         self._close_doctor_helper_preview_stream()
+        recording_path = self._finalize_session_recording()
         
         # Sonuçları kaydet ve sonuç ekranına geç
         summary = self.pose_engine.get_session_summary()
@@ -472,6 +486,15 @@ class ExerciseSessionScreen(Screen):
         
         summary['completed_at'] = datetime.now().isoformat()
         summary['exercise_name'] = self.exercise.get('name', '') if self.exercise else ''
+        summary['target_reps'] = self.target_reps
+        correct_reps = int(summary.get('correct_reps', 0))
+        accuracy = float(summary.get('accuracy_score', 0))
+        summary['session_passed'] = (
+            correct_reps >= self.target_reps
+            and accuracy >= COMPLETION_ACCURACY_MIN
+        )
+        if recording_path:
+            summary['patient_recording_path'] = recording_path
         
         # API'ye gönder
         if self.exercise and api.token:
@@ -532,6 +555,61 @@ class ExerciseSessionScreen(Screen):
             self.camera = None
         self._green_frame_count = 0
         self._using_droidcam = False
+
+    def _prepare_session_recording(self):
+        if self._recording_path:
+            return
+
+        exercise_id = self.exercise.get('id', 'exercise') if self.exercise else 'exercise'
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        recordings_dir = os.path.join(tempfile.gettempdir(), 'physioconnect_recordings')
+        os.makedirs(recordings_dir, exist_ok=True)
+        self._recording_path = os.path.join(
+            recordings_dir,
+            f'patient_{exercise_id}_{timestamp}.mp4'
+        )
+
+    def _write_session_recording(self, frame_bgr):
+        if not self._recording_path or frame_bgr is None:
+            return
+
+        height, width = frame_bgr.shape[:2]
+        frame_size = (width, height)
+        if self._recording_writer is None or self._recording_size != frame_size:
+            self._close_session_recording()
+            self._recording_size = frame_size
+
+            writer = cv2.VideoWriter(
+                self._recording_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                20.0,
+                frame_size
+            )
+            if not writer.isOpened():
+                fallback_path = os.path.splitext(self._recording_path)[0] + '.avi'
+                writer = cv2.VideoWriter(
+                    fallback_path,
+                    cv2.VideoWriter_fourcc(*'MJPG'),
+                    20.0,
+                    frame_size
+                )
+                self._recording_path = fallback_path if writer.isOpened() else None
+
+            self._recording_writer = writer if writer.isOpened() else None
+
+        if self._recording_writer:
+            self._recording_writer.write(frame_bgr)
+
+    def _close_session_recording(self):
+        if self._recording_writer:
+            self._recording_writer.release()
+            self._recording_writer = None
+
+    def _finalize_session_recording(self):
+        self._close_session_recording()
+        if self._recording_path and os.path.exists(self._recording_path):
+            return self._recording_path
+        return None
     
     def _update_frame(self, dt):
         if not self.is_running or self.camera is None:
@@ -564,6 +642,7 @@ class ExerciseSessionScreen(Screen):
         
         # Kamera görüntüsünü güncelle
         self._frame_to_texture(annotated)
+        self._write_session_recording(annotated)
         
         # UI güncelle
         self.similarity_meter.update(similarity)
@@ -640,12 +719,12 @@ class ExerciseSessionScreen(Screen):
 
         ret, frame = self._doctor_preview_cap.read()
         if not ret or frame is None:
-            # Loop
             self._doctor_preview_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self._doctor_preview_cap.read()
             if not ret or frame is None:
                 return
 
+        frame = preprocess_frame(frame)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_flip = cv2.flip(frame_rgb, 0)
         buf = frame_flip.tobytes()
@@ -690,6 +769,7 @@ class ExerciseSessionScreen(Screen):
             ret, frame = self._doctor_helper_cap.read()
             if not ret or frame is None:
                 return
+        frame = preprocess_frame(frame)
         frame = cv2.resize(frame, (320, 220))
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_flip = cv2.flip(frame_rgb, 0)
@@ -734,6 +814,7 @@ class ExerciseSessionScreen(Screen):
         self._close_camera()
         self._close_doctor_helper_preview_stream()
         self._close_doctor_video_preview_stream()
+        self._close_session_recording()
         if self._clock_event:
             self._clock_event.cancel()
         self.pose_engine.release()
@@ -743,6 +824,7 @@ class ExerciseSessionScreen(Screen):
         self._close_camera()
         self._close_doctor_helper_preview_stream()
         self._close_doctor_video_preview_stream()
+        self._close_session_recording()
         if self._clock_event:
             self._clock_event.cancel()
         self._cleanup_temp_doctor_video()

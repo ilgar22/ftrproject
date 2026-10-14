@@ -47,13 +47,11 @@ DEMO_EXERCISES = [
     },
     {
         'id': 4,
-        'name': 'Biceps Curl Test',
-        'daily_reps': 12,
-        'schedule': 'Test Seansi',
+        'name': 'Demo — Doktor Atamasi Gerekli',
+        'daily_reps': 10,
+        'schedule': 'Demo',
         'status': 'pending',
-        'description': 'Dirsek acisina gore tekrar sayimi',
-        'mode': 'biceps',
-        'side': 'auto',
+        'description': 'Gercek kontrol icin doktor videosu yukleyin',
     },
 ]
 
@@ -94,7 +92,7 @@ class PatientDashboard(Screen):
         logout_btn = Button(
             text='Çıkış',
             font_size=dp(12),
-            color=c('button_text'),
+            color=c('link'),
             background_color=(0, 0, 0, 0),
             size_hint_x=None,
             width=dp(60),
@@ -116,7 +114,7 @@ class PatientDashboard(Screen):
         
         # Karşılama
         self.welcome_label = Label(
-            text='Merhaba! 👋',
+            text='Merhaba!',
             font_size=dp(20),
             bold=True,
             color=c('text_main'),
@@ -133,14 +131,12 @@ class PatientDashboard(Screen):
         stats_row = BoxLayout(
             spacing=dp(10),
             size_hint_y=None,
-            height=dp(100),
+            height=dp(88),
         )
         
-        self.stat_sessions = StatCard('📅', '0', 'Toplam Seans')
-        self.stat_streak   = StatCard('🔥', '0', 'Günlük Seri',
-                                       accent=c('warning'))
-        self.stat_accuracy = StatCard('🎯', '0%', 'Doğruluk',
-                                       accent=c('success'))
+        self.stat_sessions = StatCard('0', 'Toplam Seans', accent=c('primary'))
+        self.stat_streak   = StatCard('0', 'Günlük Seri', accent=c('warning'))
+        self.stat_accuracy = StatCard('0%', 'Doğruluk', accent=c('success'))
         
         stats_row.add_widget(self.stat_sessions)
         stats_row.add_widget(self.stat_streak)
@@ -194,12 +190,14 @@ class PatientDashboard(Screen):
         
         # Karşılama metnini güncelle
         name = api.user.get('name', 'Hasta') if api.user else 'Hasta'
-        self.welcome_label.text = f'Merhaba, {name}! 👋'
+        self.welcome_label.text = f'Merhaba, {name}!'
     
     def _on_exercises_loaded(self, success, data):
         def update(dt):
             self.exercise_container.clear_widgets()
-            exercises = data if success else DEMO_EXERCISES
+            exercises = data if data else []
+            if not exercises and not success:
+                exercises = DEMO_EXERCISES
             
             if not exercises:
                 self.exercise_container.add_widget(Label(
