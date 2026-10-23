@@ -12,7 +12,8 @@ physio_app/
 │
 ├── services/
 │   ├── api_service.py          # Replit backend API bağlantısı
-│   └── pose_engine.py          # MediaPipe pose analiz motoru
+│   ├── pose_engine.py          # MediaPipe pose analiz motoru (heavy, 3B)
+│   └── phase_aligner.py        # Faz şablonu + çevrimiçi hizalama / tekrar sayımı
 │
 ├── screens/
 │   ├── login_screen.py         # Giriş ekranı
@@ -103,14 +104,36 @@ Uygulama şu endpoint'leri bekler:
 ]
 ```
 
-## 🧠 Pose Engine Mantığı
+## 🧠 Pose Engine Mantığı (v3)
 
-1. **Referans yükleme**: Doktorun videosu Replit'te işlenir → eklem açıları JSON olarak kaydedilir
-2. **Gerçek zamanlı analiz**: MediaPipe her frame'de 33 landmark tespit eder
-3. **Açı hesaplama**: 8 kritik eklem için açı değerleri çıkarılır
-4. **Karşılaştırma**: Sliding window DTW ile referans ile anlık poz karşılaştırılır
-5. **Geri bildirim**: >20° fark = uyarı, >35° fark = hata
-6. **Tekrar sayma**: Benzerlik eşiği aşılınca tekrar sayacı artar
+1. **Poz kestirimi**: MediaPipe Pose Landmarker **heavy** modeli (`services/pose_landmarker_heavy.task`,
+   ilk çalıştırmada otomatik indirilir; `POSE_MODEL_VARIANT=full|lite` ile değiştirilebilir).
+   Eklem açıları 3B **dünya koordinatlarından** (metre, kalça merkezli) hesaplanır; kamera açısına bağımlılık azalır.
+2. **Referans şablonu** (`services/phase_aligner.py` → `build_template`): doktor videosundaki açı izleri
+   lider eklemin ilerleme sinyaline göre tekrarlara bölünür; her tekrar 48 faz örneğine yeniden örneklenir.
+   Faz başına eklem **ortalaması** ve tekrarlar arası değişkenlikten öğrenilen **tolerans (sigma)** çıkarılır.
+   Sabit açı eşikleri yoktur; tolerans referanstan gelir.
+3. **Çevrimiçi hizalama** (`OnlineAligner`): canlı akış, döngüsel şablona kare kare dinamik programlama ile
+   hizalanır (kal / 1 / 2 / 3 faz ilerle, unutma katsayılı maliyet, histerezisli yol seçimi).
+   Tempo farkı (hızlı/yavaş yapma) hizalamada çözülür.
+4. **Tekrar sayımı**: şablon sonundan başına **sarma** = bir tekrar. Tekrar, lider eklem tepe fazına
+   ulaşmışsa ve döngü boyunca ortalama kalite eşiği aşılmışsa sayılır; aksi halde başarısız deneme olarak
+   raporlanır (`amplitude`: tam açılmadı, `form`: referansa uymadı).
+5. **Geri bildirim**: hizalanan fazdaki eklem z-skoru (|açı − ortalama| / sigma): <1,5 doğru, 1,5–2,5 uyarı, >2,5 hata.
+
+Sentetik testler: `python tests/test_phase_aligner.py`
+
+### Pose Data Formatı (v3)
+
+```json
+{
+  "frames": [{"frame": 0, "angles": {"sol_diz": 175.2, ...}, "progress": 0.0}, ...],
+  "profile": {"rep_joint": "sol_diz", "joint_ranges": {...}, "reference_reps": 4},
+  "template": {"phases": 48, "joints": [...], "mu": [[...]], "sigma": [[...]],
+               "weights": [...], "peak_phase": 24, "lead_joints": ["sol_diz", "sag_diz"]}
+}
+```
+Eski format (yalnızca `frames`) yüklenirse şablon istemci tarafında kurulur.
 
 ## 🎨 Demo Modu
 
