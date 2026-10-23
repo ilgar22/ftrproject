@@ -38,6 +38,17 @@ DEMO_PATIENTS = [
 ]
 
 
+def _parse_reps(value):
+    text = str(value).strip() if value is not None else ''
+    if not text:
+        return 10
+    try:
+        parsed = int(float(text))
+    except ValueError:
+        return 10
+    return parsed if parsed > 0 else 10
+
+
 def _get_recording_path(assignment):
     last_result = assignment.get('last_result') or {}
     return (
@@ -278,8 +289,12 @@ class DoctorDashboard(Screen):
         self.upload_status.bind(size=lambda w, s: setattr(w, 'text_size', (s[0], None)))
         upload_btn = SolidButton(text='Galeriden Video Sec ve Ata', color_hex=COLORS['primary'])
         upload_btn.bind(on_press=lambda *_: self._open_upload_popup())
+        library_btn = GlowButton(text='Egzersiz Kutuphanesi')
+        library_btn.bind(on_press=lambda *_: App.get_running_app().switch_screen('exercise_gallery'))
         upload_card.add_widget(self.upload_status)
         upload_card.add_widget(upload_btn)
+        upload_card.add_widget(library_btn)
+        upload_card.height = dp(180)
         content.add_widget(upload_card)
         
         # Hasta listesi başlık
@@ -692,7 +707,7 @@ class DoctorDashboard(Screen):
 
         payload = {
             'name': name or 'Doktor Egzersizi',
-            'daily_reps': int(reps) if str(reps).isdigit() else 10,
+            'daily_reps': _parse_reps(reps),
             'schedule': schedule or 'Gunluk',
             'description': 'Doktor videosundan olusturuldu',
             'assigned_patient_id': patient_id,

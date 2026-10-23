@@ -28,10 +28,10 @@ from widgets.components import (
     Card, SolidButton, GlowButton, TopBar,
     SimilarityMeter, FeedbackPanel, c, COLORS
 )
-from services.pose_engine import PoseEngine, COMPLETION_ACCURACY_MIN, preprocess_frame
+from services.pose_engine import PoseEngine, preprocess_frame
 from services.api_service import api
 
-DROIDCAM_IP = "192.168.50.139:4747"
+DROIDCAM_IP = "192.168.1.153:4747"
 DROIDCAM_URL = f"http://{DROIDCAM_IP}"
 DROIDCAM_ALT_URL = f"http://{DROIDCAM_IP}/mjpegfeed"
 
@@ -46,6 +46,9 @@ class ExerciseSessionScreen(Screen):
         self.is_running = False
         self.session_start_time = None
         self.target_reps = 10
+        self._auto_finishing = False
+        self._session_closed = False
+        self._auto_finish_event = None
         self._clock_event = None
         self._green_frame_count = 0
         self._using_droidcam = False
@@ -67,10 +70,22 @@ class ExerciseSessionScreen(Screen):
     def load_exercise(self, exercise_data):
         """Egzersiz verisini yükle ve ekranı hazırla"""
         self.exercise = exercise_data
-        self.target_reps = exercise_data.get('daily_reps', 10)
+        raw_reps = exercise_data.get('daily_reps', None)
+        if raw_reps is None or raw_reps == '':
+            self.target_reps = 10
+        else:
+            try:
+                self.target_reps = max(1, int(raw_reps))
+            except (TypeError, ValueError):
+                self.target_reps = 10
+        self._auto_finishing = False
+        self._session_closed = False
         self.pose_engine.reset_session()
+        self.pose_engine.clear_reference()
         self._reference_ready = False
         self.pose_engine.set_exercise_mode('reference')
+        self.start_btn.disabled = True
+        self.start_btn.opacity = 0.4
         self._doctor_video_source = None
         self._doctor_video_is_temp = False
         self._close_session_recording()
@@ -83,10 +98,14 @@ class ExerciseSessionScreen(Screen):
         self.rep_label.text = '0'
         self.status_label.text = 'Hazır'
         
-        # Referans pose verilerini API'den çek
         ex_id = exercise_data.get('id')
-        if ex_id:
-            api.get_exercise_pose_data(ex_id, self._on_pose_data_loaded)
+        cached = PoseEngine.get_cached_reference(ex_id) if ex_id else None
+        if cached:
+            Clock.schedule_once(lambda _dt, payload=cached: self._apply_extracted_reference(
+                payload, len(payload.get('frames', []))
+            ), 0)
+        else:
+            self._load_reference_from_video()
         self._prepare_doctor_video_source()
 
     def _prepare_doctor_video_source(self):
@@ -112,26 +131,22 @@ class ExerciseSessionScreen(Screen):
 
         api.get_exercise_video_source(ex_id, on_video_source)
 
-    def _on_pose_data_loaded(self, success, data):
-        def update(dt):
-            if success and data:
-                self.pose_engine.set_exercise_mode('reference')
-                self.pose_engine.load_reference_from_json(data)
-                self._reference_ready = self.pose_engine.has_reference()
-                self.status_label.text = 'Referans yuklendi'
-                self.status_label.color = c('success')
-            else:
-                self.status_label.text = 'Referans video indiriliyor...'
-                self.status_label.color = c('warning')
-                self._load_reference_from_video()
-        Clock.schedule_once(update, 0)
-
     def _load_reference_from_video(self):
         ex_id = self.exercise.get('id') if self.exercise else None
         if not ex_id:
             self.status_label.text = 'Demo modu (egzersiz kimligi yok)'
             self.status_label.color = c('warning')
             return
+
+        def on_local_source(success, source, _is_temp):
+            if success and source and os.path.exists(str(source)):
+                threading.Thread(
+                    target=self._extract_reference_worker,
+                    args=(source, False),
+                    daemon=True,
+                ).start()
+                return
+            api.download_exercise_video(ex_id, on_video_downloaded)
 
         def on_video_downloaded(success, local_path):
             if not success or not local_path:
@@ -140,17 +155,15 @@ class ExerciseSessionScreen(Screen):
                     0
                 )
                 return
-
-            thread = threading.Thread(
+            threading.Thread(
                 target=self._extract_reference_worker,
-                args=(local_path,),
-                daemon=True
-            )
-            thread.start()
+                args=(local_path, True),
+                daemon=True,
+            ).start()
 
-        api.download_exercise_video(ex_id, on_video_downloaded)
+        api.get_exercise_video_source(ex_id, on_local_source)
 
-    def _extract_reference_worker(self, local_video_path):
+    def _extract_reference_worker(self, local_video_path, delete_after=False):
         Clock.schedule_once(
             lambda dt: self._set_status('Referans video analiz ediliyor...', 'warning'),
             0
@@ -159,6 +172,9 @@ class ExerciseSessionScreen(Screen):
         try:
             sequence = worker.extract_reference_from_video(local_video_path)
             frames = sequence.get('frames', []) if isinstance(sequence, dict) else []
+            ex_id = self.exercise.get('id') if self.exercise else None
+            if sequence and frames:
+                PoseEngine.cache_reference(ex_id, sequence)
             Clock.schedule_once(
                 lambda dt: self._apply_extracted_reference(sequence, len(frames)),
                 0
@@ -170,11 +186,12 @@ class ExerciseSessionScreen(Screen):
             )
         finally:
             worker.release()
-            try:
-                if os.path.exists(local_video_path):
-                    os.remove(local_video_path)
-            except OSError:
-                pass
+            if delete_after:
+                try:
+                    if os.path.exists(local_video_path):
+                        os.remove(local_video_path)
+                except OSError:
+                    pass
 
     def _apply_extracted_reference(self, sequence, frame_count):
         if sequence and frame_count >= 8:
@@ -185,6 +202,8 @@ class ExerciseSessionScreen(Screen):
 
     def _set_reference_ready(self, frame_count):
         self._reference_ready = self.pose_engine.has_reference()
+        self.start_btn.disabled = not self._reference_ready
+        self.start_btn.opacity = 1.0 if self._reference_ready else 0.4
         if self._reference_ready:
             self._set_status(f'Referans hazir ({frame_count} frame)', 'success')
         else:
@@ -440,6 +459,8 @@ class ExerciseSessionScreen(Screen):
             self._set_status('Referans yuklenmeden baslatilamaz', 'error')
             return
 
+        self._auto_finishing = False
+        self._session_closed = False
         self.is_running = True
         self.session_start_time = datetime.now()
         self.start_btn.text = 'Duraklat'
@@ -458,7 +479,7 @@ class ExerciseSessionScreen(Screen):
         
         # Clock ile frame güncelleme
         self._prepare_session_recording()
-        self._clock_event = Clock.schedule_interval(self._update_frame, 1/25)
+        self._clock_event = Clock.schedule_interval(self._update_frame, 0)
         self._start_doctor_helper_preview()
     
     def _pause_session(self):
@@ -472,6 +493,13 @@ class ExerciseSessionScreen(Screen):
         self._close_doctor_helper_preview_stream()
     
     def _finish_session(self, *a):
+        if self._session_closed:
+            return
+        self._session_closed = True
+        self._auto_finishing = True
+        if self._auto_finish_event is not None:
+            self._auto_finish_event.cancel()
+            self._auto_finish_event = None
         self._pause_session()
         self._close_camera()
         self._close_doctor_helper_preview_stream()
@@ -487,12 +515,7 @@ class ExerciseSessionScreen(Screen):
         summary['completed_at'] = datetime.now().isoformat()
         summary['exercise_name'] = self.exercise.get('name', '') if self.exercise else ''
         summary['target_reps'] = self.target_reps
-        correct_reps = int(summary.get('correct_reps', 0))
-        accuracy = float(summary.get('accuracy_score', 0))
-        summary['session_passed'] = (
-            correct_reps >= self.target_reps
-            and accuracy >= COMPLETION_ACCURACY_MIN
-        )
+        summary['session_passed'] = int(summary.get('correct_reps', 0)) >= int(self.target_reps)
         if recording_path:
             summary['patient_recording_path'] = recording_path
         
@@ -544,6 +567,10 @@ class ExerciseSessionScreen(Screen):
 
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
             self.camera = cap
             self._using_droidcam = is_droidcam
             self._green_frame_count = 0
@@ -612,6 +639,8 @@ class ExerciseSessionScreen(Screen):
         return None
     
     def _update_frame(self, dt):
+        if self._auto_finishing or self._session_closed:
+            return
         if not self.is_running or self.camera is None:
             return
         
@@ -630,11 +659,7 @@ class ExerciseSessionScreen(Screen):
                 self._using_droidcam = False
             return
         self._green_frame_count = 0
-        
-        # Portrait orientation: rotate frame by -90 degrees (clockwise).
-        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        # Selfie mirror
-        frame = cv2.flip(frame, 1)
+        frame = preprocess_frame(frame)
         
         # Pose analizi
         annotated, similarity, feedback, rep_count, joint_status = \
@@ -657,11 +682,16 @@ class ExerciseSessionScreen(Screen):
             self.helper_hint_label.text = 'Yardimci: Hareketi doktor videosu ile senkron yapin'
             self.helper_hint_label.color = c('success')
         self.rep_label.text = str(rep_count)
-        
-        # Hedef tamamlandı mı?
-        if rep_count >= self.target_reps:
-            self.status_label.text = f'{self.target_reps} tekrar tamamlandi'
+
+        if rep_count >= self.target_reps and not self._auto_finishing:
+            self._auto_finishing = True
+            self.is_running = False
+            self.status_label.text = 'Hedef tamamlandi!'
             self.status_label.color = c('success')
+            if self._clock_event:
+                self._clock_event.cancel()
+                self._clock_event = None
+            self._auto_finish_event = Clock.schedule_once(lambda _dt: self._finish_session(), 1.5)
     
     def _frame_to_texture(self, frame_bgr):
         """OpenCV frame'ini Kivy texture'a dönüştür"""

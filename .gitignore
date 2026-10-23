@@ -12,6 +12,8 @@ __pycache__/
 data/*.json
 data/videos/
 data/physio_store.json
+data/*.db
+data/cache/
 
 # Gecici kayitlar
 *.mp4

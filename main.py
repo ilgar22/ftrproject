@@ -13,6 +13,7 @@ from kivy.uix.screenmanager import ScreenManager, SlideTransition
 from kivy.utils import get_color_from_hex
 
 from screens.doctor_dashboard import DoctorDashboard
+from screens.exercise_gallery import ExerciseGalleryScreen
 from screens.exercise_list import ExerciseListScreen
 from screens.exercise_session import ExerciseSessionScreen
 from screens.login_screen import LoginScreen
@@ -32,6 +33,7 @@ class PhysioApp(App):
             LoginScreen(name='login'),
             PatientDashboard(name='patient_dashboard'),
             DoctorDashboard(name='doctor_dashboard'),
+            ExerciseGalleryScreen(name='exercise_gallery'),
             ExerciseListScreen(name='exercise_list'),
             ExerciseSessionScreen(name='exercise_session'),
             ResultsScreen(name='results'),

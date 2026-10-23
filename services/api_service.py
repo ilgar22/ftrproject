@@ -2,15 +2,15 @@
 API Service — HTTP + kalici yerel depolama.
 """
 
-import json
 import os
-import shutil
 import threading
 import tempfile
 
 import requests
 
-from services import local_store
+from services import database as db
+from services import exercise_library as library
+from services.exercise_library import ApiError
 
 
 def _normalize_base_url(raw_url):
@@ -37,22 +37,37 @@ class APIService:
     def _init_state(self):
         self.token = None
         self.user = None
-        store = local_store.load()
+        self._migrate_json_store()
+        store = db.load_state()
         self.local_exercises = store.get('exercises', [])
         self.local_pose_data = store.get('pose_data', {})
         self.local_video_paths = store.get('video_paths', {})
         self.local_session_recordings = store.get('session_recordings', {})
         self._next_local_exercise_id = int(store.get('next_exercise_id', 1000))
 
+    def _migrate_json_store(self):
+        """Eski JSON kaydini bir kez SQLite'a tasir."""
+        from services import local_store
+        existing = db.load_state()
+        if existing.get('exercises'):
+            return
+        legacy = local_store.load()
+        exercises = legacy.get('exercises') or []
+        if not exercises:
+            return
+        for exercise in exercises:
+            ex_id = int(exercise['id'])
+            db.save_exercise(exercise, legacy.get('pose_data', {}).get(ex_id))
+            video = (legacy.get('video_paths') or {}).get(ex_id)
+            recording = (legacy.get('session_recordings') or {}).get(ex_id)
+            if video:
+                db.save_video_file(ex_id, 'doctor', video)
+            if recording:
+                db.save_video_file(ex_id, 'patient', recording)
+        db.save_exercises(exercises, legacy.get('next_exercise_id', 1000))
+
     def _persist(self):
-        local_store.save({
-            'version': 1,
-            'next_exercise_id': self._next_local_exercise_id,
-            'exercises': self.local_exercises,
-            'pose_data': self.local_pose_data,
-            'video_paths': self.local_video_paths,
-            'session_recordings': self.local_session_recordings,
-        })
+        db.save_exercises(self.local_exercises, self._next_local_exercise_id)
 
     def _get_headers(self):
         headers = {'Content-Type': 'application/json'}
@@ -139,7 +154,7 @@ class APIService:
 
     def get_exercises(self, callback):
         def _run():
-            local = self._local_exercises_for_user()
+            local = self._with_daily_reps(self._local_exercises_for_user())
             if local:
                 callback(True, local)
                 return
@@ -149,7 +164,7 @@ class APIService:
             try:
                 r = requests.get(f'{BASE_URL}/exercises', headers=self._get_headers(), timeout=10)
                 if r.status_code == 200:
-                    callback(True, r.json())
+                    callback(True, self._with_daily_reps(r.json() or []))
                 else:
                     callback(True, local)
             except Exception:
@@ -186,8 +201,9 @@ class APIService:
             except Exception:
                 callback(False, None, False)
                 return
-            local_path = self.local_video_paths.get(ex_id)
+            local_path = self.local_video_paths.get(ex_id) or db.export_video(ex_id, 'doctor')
             if local_path and os.path.exists(local_path):
+                self.local_video_paths[ex_id] = local_path
                 callback(True, local_path, False)
                 return
             if not BASE_URL:
@@ -253,6 +269,8 @@ class APIService:
                     passed = correct >= target and accuracy >= 50.0
                 ex['status'] = 'completed' if (passed and target > 0) else 'in_progress'
                 if recording_path:
+                    stored = db.save_video_file(int(exercise_id), 'patient', recording_path)
+                    recording_path = stored or recording_path
                     ex['patient_recording_path'] = recording_path
                     self.local_session_recordings[int(exercise_id)] = recording_path
                 ex['last_result'] = {
@@ -374,35 +392,175 @@ class APIService:
                 callback(True, [])
         threading.Thread(target=_run, daemon=True).start()
 
+    def _with_daily_reps(self, items):
+        published = []
+        for exercise in items or []:
+            row = dict(exercise)
+            if row.get('daily_reps') is not None:
+                row['daily_reps'] = int(row['daily_reps'])
+            published.append(row)
+        return published
+
     def create_exercise_from_video(self, exercise_payload, pose_sequence, video_path, callback):
         def _run():
             try:
-                ex_id = self._next_local_exercise_id
-                self._next_local_exercise_id += 1
+                reps = exercise_payload.get('daily_reps', 10)
+                template, exercise, pose = library.register_upload(
+                    self.user,
+                    exercise_payload.get('name') or 'Yeni Egzersiz',
+                    video_path,
+                    pose_sequence or {'frames': [], 'profile': {}},
+                    assigned_patient_id=exercise_payload.get('assigned_patient_id'),
+                    assigned_patient_name=exercise_payload.get('assigned_patient_name') or '',
+                    daily_reps=int(reps),
+                    schedule=exercise_payload.get('schedule') or 'Gunluk',
+                    description=exercise_payload.get('description') or 'Doktor tarafindan yuklendi',
+                    exercise_id=self._next_local_exercise_id,
+                )
+                if exercise:
+                    self._next_local_exercise_id = int(exercise['id']) + 1
+                    self.local_exercises.insert(0, exercise)
+                    self.local_pose_data[int(exercise['id'])] = pose
+                    self.local_video_paths[int(exercise['id'])] = exercise.get('video_path')
+                    self._persist()
+                callback(True, exercise or template)
+            except ApiError as exc:
+                callback(False, exc.detail)
+            except Exception as exc:
+                callback(False, str(exc))
+        threading.Thread(target=_run, daemon=True).start()
 
-                data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'videos')
-                os.makedirs(data_dir, exist_ok=True)
-                dest = os.path.join(data_dir, f'exercise_{ex_id}.mp4')
-                if video_path and os.path.exists(video_path):
-                    if os.path.abspath(video_path) != os.path.abspath(dest):
-                        shutil.copy2(video_path, dest)
+    def get_exercise_library(self, callback):
+        def _run():
+            demo = isinstance(self.token, str) and self.token.startswith('demo_token')
+            if not demo and BASE_URL:
+                try:
+                    r = requests.get(
+                        f'{BASE_URL}/doctor/exercise-library',
+                        headers=self._get_headers(),
+                        timeout=10,
+                    )
+                    if r.status_code == 200:
+                        callback(True, r.json())
+                        return
+                    if r.status_code in (401, 403, 404):
+                        callback(False, r.status_code)
+                        return
+                except Exception:
+                    pass
+            try:
+                callback(True, library.list_templates(self.user))
+            except ApiError as exc:
+                callback(False, exc.status_code)
+        threading.Thread(target=_run, daemon=True).start()
 
-                exercise = {
-                    'id': ex_id,
-                    'name': exercise_payload.get('name', 'Yeni Egzersiz'),
-                    'daily_reps': int(exercise_payload.get('daily_reps', 10)),
-                    'schedule': exercise_payload.get('schedule', 'Gunluk'),
-                    'status': 'pending',
-                    'description': exercise_payload.get('description', 'Doktor tarafindan yuklendi'),
-                    'assigned_by': 'doctor',
-                    'assigned_patient_id': exercise_payload.get('assigned_patient_id'),
-                    'assigned_patient_name': exercise_payload.get('assigned_patient_name'),
-                }
-                self.local_exercises.insert(0, exercise)
-                self.local_pose_data[ex_id] = pose_sequence or {'frames': [], 'profile': {}}
-                self.local_video_paths[ex_id] = dest
-                self._persist()
+    def rename_library_exercise(self, exercise_id, name, callback):
+        def _run():
+            try:
+                updated = library.update_template(self.user, exercise_id, name)
+            except ApiError as exc:
+                callback(False, exc.detail)
+                return
+            demo = isinstance(self.token, str) and self.token.startswith('demo_token')
+            if demo or not BASE_URL:
+                callback(True, updated)
+                return
+            try:
+                r = requests.patch(
+                    f'{BASE_URL}/doctor/exercise-library/{exercise_id}',
+                    json={'name': updated['name']},
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if r.status_code in (200, 204):
+                    callback(True, r.json() if r.content else updated)
+                elif r.status_code in (401, 403, 404, 422):
+                    callback(False, r.status_code)
+                else:
+                    callback(True, updated)
+            except Exception:
+                callback(True, updated)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def delete_library_exercise(self, exercise_id, callback):
+        def _run():
+            try:
+                result = library.delete_template(self.user, exercise_id)
+            except ApiError as exc:
+                callback(False, exc.detail)
+                return
+            demo = isinstance(self.token, str) and self.token.startswith('demo_token')
+            if demo or not BASE_URL:
+                callback(True, result)
+                return
+            try:
+                r = requests.delete(
+                    f'{BASE_URL}/doctor/exercise-library/{exercise_id}',
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if r.status_code in (200, 204):
+                    callback(True, result)
+                elif r.status_code in (401, 403, 404):
+                    callback(False, r.status_code)
+                else:
+                    callback(True, result)
+            except Exception:
+                callback(True, result)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def assign_library_exercise(self, exercise_id, patient_id, daily_reps, callback, patient_name=''):
+        def _run():
+            try:
+                reps = int(daily_reps)
+                exercise, pose = library.assign_template(
+                    self.user,
+                    exercise_id,
+                    patient_id,
+                    reps,
+                    patient_name=patient_name,
+                    exercise_id=self._next_local_exercise_id,
+                )
+            except (ApiError, ValueError) as exc:
+                detail = exc.detail if isinstance(exc, ApiError) else 'daily_reps pozitif tam sayi olmali'
+                callback(False, detail)
+                return
+            self._next_local_exercise_id = int(exercise['id']) + 1
+            self.local_exercises.insert(0, exercise)
+            self.local_pose_data[int(exercise['id'])] = pose
+            self.local_video_paths[int(exercise['id'])] = exercise.get('video_path')
+            self._persist()
+            demo = isinstance(self.token, str) and self.token.startswith('demo_token')
+            if demo or not BASE_URL:
                 callback(True, exercise)
+                return
+            try:
+                r = requests.post(
+                    f'{BASE_URL}/doctor/exercise-library/{exercise_id}/assign',
+                    json={'patient_id': patient_id, 'daily_reps': reps},
+                    headers=self._get_headers(),
+                    timeout=10,
+                )
+                if r.status_code in (200, 201):
+                    callback(True, r.json())
+                else:
+                    callback(True, exercise)
+            except Exception:
+                callback(True, exercise)
+        threading.Thread(target=_run, daemon=True).start()
+
+    def save_to_library(self, name, video_path, callback):
+        def _run():
+            try:
+                template, _exercise, _pose = library.register_upload(
+                    self.user,
+                    name,
+                    video_path,
+                    None,
+                )
+                callback(True, template)
+            except ApiError as exc:
+                callback(False, exc.detail)
             except Exception as exc:
                 callback(False, str(exc))
         threading.Thread(target=_run, daemon=True).start()
