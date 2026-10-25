@@ -109,9 +109,10 @@ Uygulama şu endpoint'leri bekler:
 1. **Poz kestirimi**: MediaPipe Pose Landmarker **heavy** modeli (`services/pose_landmarker_heavy.task`,
    ilk çalıştırmada otomatik indirilir; `POSE_MODEL_VARIANT=full|lite` ile değiştirilebilir).
    Eklem açıları 3B **dünya koordinatlarından** (metre, kalça merkezli) hesaplanır; kamera açısına bağımlılık azalır.
+   Açıların yanına el ve ayak bileği **konumları** eklenir (kalça merkezli, gövde boyuna normalize 3B koordinat — 12 öznitelik).
 2. **Referans şablonu** (`services/phase_aligner.py` → `build_template`): doktor videosundaki açı izleri
    lider eklemin ilerleme sinyaline göre tekrarlara bölünür; her tekrar 48 faz örneğine yeniden örneklenir.
-   Faz başına eklem **ortalaması** ve tekrarlar arası değişkenlikten öğrenilen **tolerans (sigma)** çıkarılır.
+   Faz başına öznitelik **ortalaması** ve tekrarlar arası değişkenlikten öğrenilen **tolerans (sigma)** çıkarılır (açılar derece, konumlar gövde birimi).
    Sabit açı eşikleri yoktur; tolerans referanstan gelir.
 3. **Çevrimiçi hizalama** (`OnlineAligner`): canlı akış, döngüsel şablona kare kare dinamik programlama ile
    hizalanır (kal / 1 / 2 / 3 faz ilerle, unutma katsayılı maliyet, histerezisli yol seçimi).

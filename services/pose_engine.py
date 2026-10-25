@@ -23,8 +23,8 @@ import mediapipe as mp
 import numpy as np
 
 from services.phase_aligner import (
-    JOINT_NAMES_TR, JOINTS, OnlineAligner, build_template, frames_to_matrix,
-    joint_roles, progress_signal,
+    ENDPOINT_NAMES_TR, JOINT_NAMES_TR, JOINTS, OnlineAligner, build_template,
+    frames_to_matrix, joint_roles, progress_signal,
 )
 
 # ─── MediaPipe Tasks API ─────────────────────────────────────────────────────
@@ -147,6 +147,34 @@ def extract_visibility(landmarks):
         name: float(min(_vis(landmarks[a]), _vis(landmarks[b]), _vis(landmarks[c])))
         for name, (a, b, c) in JOINT_ANGLES.items()
     }
+
+
+ENDPOINT_LANDMARKS = {
+    'sol_el': LM.LEFT_WRIST, 'sag_el': LM.RIGHT_WRIST,
+    'sol_ayak': LM.LEFT_ANKLE, 'sag_ayak': LM.RIGHT_ANKLE,
+}
+
+
+def extract_points(world_landmarks, image_landmarks=None, min_visibility=MIN_VISIBILITY):
+    """El ve ayak bilegi konumlari: kalca merkezli, govde boyuna normalize 3B koordinatlar."""
+    if not world_landmarks or len(world_landmarks) < 33:
+        return {}
+    vis_src = image_landmarks if image_landmarks and len(image_landmarks) >= 33 else world_landmarks
+    l_hip, r_hip = world_landmarks[LM.LEFT_HIP], world_landmarks[LM.RIGHT_HIP]
+    l_sh, r_sh = world_landmarks[LM.LEFT_SHOULDER], world_landmarks[LM.RIGHT_SHOULDER]
+    hip = np.array([(l_hip.x + r_hip.x) * 0.5, (l_hip.y + r_hip.y) * 0.5, (l_hip.z + r_hip.z) * 0.5])
+    sh = np.array([(l_sh.x + r_sh.x) * 0.5, (l_sh.y + r_sh.y) * 0.5, (l_sh.z + r_sh.z) * 0.5])
+    scale = max(float(np.linalg.norm(sh - hip)), 1e-3)
+    points = {}
+    for name, idx in ENDPOINT_LANDMARKS.items():
+        if _vis(vis_src[idx]) <= min_visibility:
+            continue
+        lm = world_landmarks[idx]
+        rel = (np.array([lm.x, lm.y, lm.z]) - hip) / scale
+        points[f'{name}_x'] = round(float(rel[0]), 4)
+        points[f'{name}_y'] = round(float(rel[1]), 4)
+        points[f'{name}_z'] = round(float(rel[2]), 4)
+    return points
 
 
 class PoseEngine:
@@ -286,7 +314,11 @@ class PoseEngine:
             if lms and world:
                 angles = extract_angles(world, lms)
                 if len(angles) >= MIN_JOINTS:
-                    sequence.append({'frame': frame_idx, 'angles': angles})
+                    sequence.append({
+                        'frame': frame_idx,
+                        'angles': angles,
+                        'points': extract_points(world, lms),
+                    })
             if callback_progress:
                 try:
                     callback_progress(frame_idx / total, frame_idx, total)
@@ -376,17 +408,22 @@ class PoseEngine:
         self._last_landmarks, self._last_world = landmarks, world
         shape = frame_bgr.shape
         current_angles = extract_angles(world, landmarks)
-        self.live_pipeline_steps.append(f'{len(current_angles)} eklem acisi (3B) hesaplandi')
+        current_points = extract_points(world, landmarks)
+        self.live_pipeline_steps.append(
+            f'{len(current_angles)} eklem acisi + {len(current_points) // 3} uc nokta (3B) hesaplandi'
+        )
 
         feedback, joint_status, similarity = [], {}, 0.0
         if self.aligner.configured and current_angles:
-            decision = self.aligner.step(current_angles, now=self._frame_time())
+            features = dict(current_angles)
+            features.update(current_points)
+            decision = self.aligner.step(features, now=self._frame_time())
             self.current_phase = decision['phase']
             similarity = decision['quality']
             joint_status, feedback = self.aligner.joint_status(decision.get('z'))
             for joint, status in joint_status.items():
                 if status == 'error':
-                    self.joint_error_counts[joint] += 1
+                    self.joint_error_counts[joint] = self.joint_error_counts.get(joint, 0) + 1
             self.live_pipeline_steps.append(
                 f'Faz %{int(self.current_phase * 100)} — hizalama kalitesi %{int(similarity * 100)}'
             )
@@ -482,6 +519,13 @@ class PoseEngine:
             color = {'ok': COLOR_OK, 'warning': COLOR_WARN, 'error': COLOR_ERROR}.get(status, COLOR_OK)
             radius = {'ok': 5, 'warning': 7, 'error': 9}.get(status, 5)
             cv2.circle(frame, pts[b_i], radius, color, -1, cv2.LINE_AA)
+        for ep, idx in ENDPOINT_LANDMARKS.items():
+            if idx not in pts or ep not in joint_status:
+                continue
+            status = joint_status[ep]
+            color = {'ok': COLOR_OK, 'warning': COLOR_WARN, 'error': COLOR_ERROR}.get(status, COLOR_OK)
+            radius = {'ok': 5, 'warning': 7, 'error': 9}.get(status, 5)
+            cv2.circle(frame, pts[idx], radius, color, -1, cv2.LINE_AA)
 
     # ─── Oturum ──────────────────────────────────────────────────────────────
 
@@ -489,12 +533,14 @@ class PoseEngine:
         counted = self.aligner.count
         accuracy = self.aligner.mean_quality() * 100.0
         top_errors = sorted(self.joint_error_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        names = dict(JOINT_NAMES_TR)
+        names.update(ENDPOINT_NAMES_TR)
         return {
             'total_reps': counted,
             'correct_reps': counted,
             'failed_attempts': self.aligner.attempts,
             'accuracy_score': round(accuracy, 1),
-            'joint_errors': {JOINT_NAMES_TR.get(k, k): v for k, v in top_errors if v > 0},
+            'joint_errors': {names.get(k, k): v for k, v in top_errors if v > 0},
             'rep_history': list(self.error_history),
         }
 

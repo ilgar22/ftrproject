@@ -15,6 +15,8 @@ Model:
 Bu modul cv2 ve mediapipe kullanmaz; sentetik aci serileriyle test edilebilir.
 """
 
+import warnings
+
 import numpy as np
 
 JOINTS = [
@@ -29,12 +31,27 @@ JOINT_NAMES_TR = {
     'sol_diz': 'Sol Diz', 'sag_diz': 'Sag Diz',
 }
 
+# Uc noktalar: el (bilek) ve ayak (ayak bilegi) konumlari — kalca merkezli,
+# govde boyuna normalize 3B koordinatlar (x, y, z ayri birer oznitelik)
+ENDPOINTS = ['sol_el', 'sag_el', 'sol_ayak', 'sag_ayak']
+ENDPOINT_NAMES_TR = {
+    'sol_el': 'Sol El', 'sag_el': 'Sag El',
+    'sol_ayak': 'Sol Ayak', 'sag_ayak': 'Sag Ayak',
+}
+POS_FEATURES = [f'{e}_{c}' for e in ENDPOINTS for c in 'xyz']
+FEATURES = JOINTS + POS_FEATURES
+FEATURE_INDEX = {name: i for i, name in enumerate(FEATURES)}
+
 # Sablon
 PHASES = 48                 # faz ornegi sayisi
 RANGE_MIN_DEGREES = 15.0    # bu degerin altinda hareket eden eklem "sabit" sayilir
 SIGMA_FLOOR = 6.0           # derece — poz kestirim gurultusu tabani
 SIGMA_NOISE = 5.0           # derece — referansa eklenen olcum gurultusu
 SIGMA_SINGLE_REP = 10.0     # referansta tek tekrar varsa kullanilan tolerans
+POS_SIGMA_FLOOR = 0.06      # govde birimi — konum toleransi tabani
+POS_SIGMA_NOISE = 0.05      # govde birimi — konum olcum gurultusu
+POS_SIGMA_SINGLE = 0.12     # govde birimi — tek tekrarli referans
+POS_RANGE_MIN = 0.08        # govde birimi — bunun altinda hareket eden konum "sabit"
 SMOOTH_WIN = 5              # referans izi yumusatma penceresi (kare)
 
 # Tekrar bolutleme (referans ve ilerleme)
@@ -78,12 +95,16 @@ def _smooth(series, win=SMOOTH_WIN):
 
 
 def frames_to_matrix(frames):
-    """[{angles:{...}}, ...] -> (T x J) matris, eksik eklem = NaN."""
+    """[{angles:{...}, points:{...}}, ...] -> (T x F) matris, eksik oznitelik = NaN."""
     T = len(frames)
-    mat = np.full((T, len(JOINTS)), np.nan, dtype=np.float64)
+    mat = np.full((T, len(FEATURES)), np.nan, dtype=np.float64)
     for t, item in enumerate(frames):
         for name, val in (item.get('angles') or {}).items():
-            j = JOINT_INDEX.get(name)
+            j = FEATURE_INDEX.get(name)
+            if j is not None and val is not None:
+                mat[t, j] = float(val)
+        for name, val in (item.get('points') or {}).items():
+            j = FEATURE_INDEX.get(name)
             if j is not None and val is not None:
                 mat[t, j] = float(val)
     return mat
@@ -215,22 +236,35 @@ def build_template(frames):
         reps = [(0, mat.shape[0] - 1)]
 
     stacks = [_resample(mat[a:b + 1]) for a, b in reps]
-    cube = np.stack(stacks, axis=0)                     # K x N x J
-    mu = np.nanmean(cube, axis=0)                       # N x J
-    if cube.shape[0] >= 2:
-        sd = np.nanstd(cube, axis=0)
-        sigma = np.sqrt(sd ** 2 + SIGMA_NOISE ** 2)
+    cube = np.stack(stacks, axis=0)                     # K x N x F
+    with np.errstate(all='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        mu = np.nanmean(cube, axis=0)                   # N x F
+        sd = np.nanstd(cube, axis=0) if cube.shape[0] >= 2 else None
+    n_ang = len(JOINTS)
+    floor_vec = np.array([SIGMA_FLOOR] * n_ang + [POS_SIGMA_FLOOR] * len(POS_FEATURES))
+    noise_vec = np.array([SIGMA_NOISE] * n_ang + [POS_SIGMA_NOISE] * len(POS_FEATURES))
+    single_vec = np.array([SIGMA_SINGLE_REP] * n_ang + [POS_SIGMA_SINGLE] * len(POS_FEATURES))
+    if sd is not None:
+        sigma = np.sqrt(sd ** 2 + noise_vec[None, :] ** 2)
     else:
-        sigma = np.full_like(mu, SIGMA_SINGLE_REP)
-    sigma = np.maximum(sigma, SIGMA_FLOOR)
+        sigma = np.tile(single_vec, (mu.shape[0], 1))
+    sigma = np.maximum(sigma, floor_vec[None, :])
     sigma[np.isnan(mu)] = np.nan
 
-    # eklem agirliklari: hareket genisligine gore (sabitler de takip edilir)
-    weights = np.zeros(len(JOINTS))
+    # oznitelik agirliklari: eklemler hareket genisligine gore, konumlar sabit katsayiyla
+    weights = np.zeros(len(FEATURES))
     for d in leads:
-        weights[JOINT_INDEX[d['name']]] = float(np.clip(d['span'] / 40.0, 0.5, 1.0))
+        weights[FEATURE_INDEX[d['name']]] = float(np.clip(d['span'] / 40.0, 0.5, 1.0))
     for d in stable:
-        weights[JOINT_INDEX[d['name']]] = 0.4
+        weights[FEATURE_INDEX[d['name']]] = 0.4
+    for j in range(n_ang, len(FEATURES)):
+        col = mat[:, j]
+        valid = col[~np.isnan(col)]
+        if valid.size < 6:
+            continue
+        span = float(np.percentile(valid, 90) - np.percentile(valid, 10))
+        weights[j] = 0.3 if span < POS_RANGE_MIN else float(np.clip(span / 0.4, 0.3, 0.6))
 
     # tepe fazi: ortalama ilerleme izinin en yuksek oldugu faz
     prog_cube = np.stack([_resample(prog[a:b + 1][:, None])[:, 0] for a, b in reps], 0)
@@ -240,6 +274,7 @@ def build_template(frames):
     return {
         'phases': PHASES,
         'joints': list(JOINTS),
+        'features': list(FEATURES),
         'mu': np.where(np.isnan(mu), None, np.round(mu, 2)).tolist(),
         'sigma': np.where(np.isnan(sigma), None, np.round(sigma, 2)).tolist(),
         'weights': [round(float(w), 3) for w in weights],
@@ -277,8 +312,12 @@ class OnlineAligner:
         self.w = np.array(template.get('weights', [1.0] * mu.shape[1]), dtype=np.float64)
         self.valid = ~np.isnan(mu)
         self.peak_phase = int(template.get('peak_phase', self.N // 2))
+        # eski sablonlar yalnizca eklem listesi tasir; yenilerde 'features' var
+        self.features = list(template.get('features') or template.get('joints') or JOINTS)
+        self.fidx = {name: i for i, name in enumerate(self.features)}
+        self._angle_cols = np.array([i for i, f in enumerate(self.features) if f in JOINT_INDEX], dtype=int)
         lead = (template.get('lead_joints') or [JOINTS[0]])[0]
-        self.lead_idx = JOINT_INDEX.get(lead, 0)
+        self.lead_idx = self.fidx.get(lead, 0)
         self.reset()
 
     @property
@@ -318,10 +357,10 @@ class OnlineAligner:
         return float(np.mean(self.qualities)) if self.qualities else 0.0
 
     # ─ hesap ─
-    def _angles_vec(self, angles):
-        a = np.full(len(JOINTS), np.nan)
-        for name, val in (angles or {}).items():
-            j = JOINT_INDEX.get(name)
+    def _feature_vec(self, features):
+        a = np.full(len(self.features), np.nan)
+        for name, val in (features or {}).items():
+            j = self.fidx.get(name)
             if j is not None and val is not None:
                 a[j] = float(val)
         return a
@@ -340,13 +379,14 @@ class OnlineAligner:
     def step(self, angles, now):
         if not self.configured:
             return self._decision(0.0, 0.0, 0.0, False, 'no_template')
-        a = self._angles_vec(angles)
+        a = self._feature_vec(angles)
         if self._prev_now is None:
             self._prev_now = now
-        cost, z, n_avail = self._local_cost(a)
+        cost, z, _n_avail = self._local_cost(a)
+        n_angles = int(np.sum(~np.isnan(a[self._angle_cols])))
 
         # lider eklem gorunmuyorsa bekle; uzun surerse donguyu sifirla
-        if np.isnan(a[self.lead_idx]) or n_avail < MIN_JOINTS:
+        if np.isnan(a[self.lead_idx]) or n_angles < MIN_JOINTS:
             if self._gap_since is None:
                 self._gap_since = now
             if now - self._gap_since > VISIBILITY_HOLD_SECONDS:
@@ -492,12 +532,15 @@ class OnlineAligner:
         self._attempt_peak_seen = False
 
     def joint_status(self, zrow):
-        """z-skor satirindan eklem durumu ve ipuclari."""
+        """z-skor satirindan eklem ve uc nokta durumu ile ipuclari."""
         status, feedback = {}, []
         if zrow is None:
             return status, feedback
         for name in JOINTS:
-            jz = zrow[JOINT_INDEX[name]]
+            j = self.fidx.get(name)
+            if j is None:
+                continue
+            jz = zrow[j]
             if np.isnan(jz):
                 continue
             if jz >= Z_WARN:
@@ -508,6 +551,22 @@ class OnlineAligner:
                 feedback.append(f"{JOINT_NAMES_TR[name]}: doktor gibi yapin")
             else:
                 status[name] = 'ok'
+        for ep in ENDPOINTS:
+            cols = [self.fidx[f'{ep}_{c}'] for c in 'xyz' if f'{ep}_{c}' in self.fidx]
+            if not cols:
+                continue
+            vals = zrow[cols]
+            if np.all(np.isnan(vals)):
+                continue
+            ez = float(np.nanmax(vals))
+            if ez >= Z_WARN:
+                status[ep] = 'error'
+                feedback.append(f"{ENDPOINT_NAMES_TR[ep]}: konum referanstan sapiyor ({ez:.1f} sigma)")
+            elif ez >= Z_OK:
+                status[ep] = 'warning'
+                feedback.append(f"{ENDPOINT_NAMES_TR[ep]}: konumu doktor gibi tutun")
+            else:
+                status[ep] = 'ok'
         return status, feedback
 
     def _decision(self, phase, quality, cycle_quality, counted, reason, joint=None, zrow=None):
