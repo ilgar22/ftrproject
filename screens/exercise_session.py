@@ -16,6 +16,7 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.image import Image
+from kivy.uix.widget import Widget
 from kivy.uix.popup import Popup
 from kivy.graphics.texture import Texture
 from kivy.graphics import Color, RoundedRectangle, Rectangle
@@ -29,11 +30,59 @@ from widgets.components import (
     SimilarityMeter, FeedbackPanel, c, COLORS
 )
 from services.pose_engine import PoseEngine, preprocess_frame
+from services.session_logger import SessionLogger
 from services.api_service import api
 
-DROIDCAM_IP = "192.168.1.153:4747"
-DROIDCAM_URL = f"http://{DROIDCAM_IP}"
-DROIDCAM_ALT_URL = f"http://{DROIDCAM_IP}/mjpegfeed"
+# USB-камера. 0 — первая камера Windows; 1 используется, если 0 не открылась.
+CAMERA_INDEX = 0
+
+
+class CameraView(Widget):
+    """Один непрозрачный кадр. Предыдущая маска не остаётся под новой."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._texture = None
+        with self.canvas.before:
+            Color(*get_color_from_hex(COLORS['bg_surface']))
+            self._clear = Rectangle(pos=self.pos, size=self.size)
+        with self.canvas:
+            Color(1, 1, 1, 1)
+            self._rect = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync_rect, size=self._sync_rect)
+
+    def _sync_rect(self, *_args):
+        self._clear.pos = self.pos
+        self._clear.size = self.size
+        self._place_frame()
+
+    def _place_frame(self):
+        if self._texture is None:
+            self._rect.pos = self.pos
+            self._rect.size = self.size
+            return
+        tw, th = self._texture.size
+        if tw <= 0 or th <= 0 or self.width <= 0 or self.height <= 0:
+            return
+        scale = min(self.width / float(tw), self.height / float(th))
+        width = tw * scale
+        height = th * scale
+        self._rect.size = (width, height)
+        self._rect.pos = (
+            self.x + (self.width - width) / 2.0,
+            self.y + (self.height - height) / 2.0,
+        )
+
+    def show_frame(self, frame_bgr):
+        rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+        rgba[:, :, 3] = 255
+        rgba = cv2.flip(rgba, 0)
+        height, width = rgba.shape[:2]
+        if self._texture is None or self._texture.size != (width, height):
+            self._texture = Texture.create(size=(width, height), colorfmt='rgba')
+            self._rect.texture = self._texture
+            self._place_frame()
+        self._texture.blit_buffer(rgba.tobytes(), colorfmt='rgba', bufferfmt='ubyte')
 
 
 class ExerciseSessionScreen(Screen):
@@ -64,6 +113,9 @@ class ExerciseSessionScreen(Screen):
         self._recording_path = None
         self._recording_size = None
         self._reference_ready = False
+        self._session_logger = None
+        self._seen_history = 0
+        self._seen_tail = None
         self._build()
     
     # ─── YÜKLEME ─────────────────────────────────────────────────────────────
@@ -89,6 +141,7 @@ class ExerciseSessionScreen(Screen):
         self._doctor_video_source = None
         self._doctor_video_is_temp = False
         self._close_session_recording()
+        self._close_session_logger()
         self._recording_path = None
         self._recording_size = None
         
@@ -285,10 +338,9 @@ class ExerciseSessionScreen(Screen):
         )
         
         # Kamera feed
-        self.cam_image = Image(
+        self.cam_image = CameraView(
             size_hint=(1, 1),
             pos_hint={'center_x': 0.5, 'center_y': 0.5},
-            fit_mode='contain',
         )
         cam_container.add_widget(self.cam_image)
         
@@ -479,7 +531,21 @@ class ExerciseSessionScreen(Screen):
         
         # Clock ile frame güncelleme
         self._prepare_session_recording()
-        self._clock_event = Clock.schedule_interval(self._update_frame, 0)
+        if self._session_logger is None:
+            try:
+                egzersiz_id = self.exercise.get('id') if self.exercise else None
+                self._session_logger = SessionLogger(exercise_id=egzersiz_id)
+                self._seen_history = len(self.pose_engine.error_history)
+                self._seen_tail = (
+                    self.pose_engine.error_history[-1]
+                    if self.pose_engine.error_history else None
+                )
+            except Exception as exc:
+                print(f'[SessionLogger] oturum acilamadi: {exc}')
+                self._session_logger = None
+        if self._clock_event:
+            self._clock_event.cancel()
+        self._clock_event = Clock.schedule_interval(self._update_frame, 1 / 30)
         self._start_doctor_helper_preview()
     
     def _pause_session(self):
@@ -518,6 +584,12 @@ class ExerciseSessionScreen(Screen):
         summary['session_passed'] = int(summary.get('correct_reps', 0)) >= int(self.target_reps)
         if recording_path:
             summary['patient_recording_path'] = recording_path
+        try:
+            log_dir = self._close_session_logger(summary)
+            if log_dir:
+                summary['session_log_dir'] = str(log_dir)
+        except Exception as exc:
+            print(f'[SessionLogger] oturum kapatilamadi: {exc}')
         
         # API'ye gönder
         if self.exercise and api.token:
@@ -539,16 +611,13 @@ class ExerciseSessionScreen(Screen):
             return
 
         candidates = [
-            (DROIDCAM_URL, cv2.CAP_FFMPEG, True),
-            (DROIDCAM_ALT_URL, cv2.CAP_FFMPEG, True),
-            (f"http://{DROIDCAM_IP}/videofeed", cv2.CAP_FFMPEG, True),
-            (DROIDCAM_URL, cv2.CAP_ANY, True),
-            (DROIDCAM_ALT_URL, cv2.CAP_ANY, True),
-            (0, cv2.CAP_DSHOW, False),
-            (0, cv2.CAP_ANY, False),
+            (CAMERA_INDEX, cv2.CAP_DSHOW),
+            (CAMERA_INDEX, cv2.CAP_ANY),
+            (1, cv2.CAP_DSHOW),
+            (1, cv2.CAP_ANY),
         ]
 
-        for source, backend, is_droidcam in candidates:
+        for source, backend in candidates:
             cap = cv2.VideoCapture(source, backend)
             if not cap or not cap.isOpened():
                 if cap:
@@ -572,7 +641,7 @@ class ExerciseSessionScreen(Screen):
             except Exception:
                 pass
             self.camera = cap
-            self._using_droidcam = is_droidcam
+            self._using_droidcam = False
             self._green_frame_count = 0
             return
     
@@ -637,6 +706,46 @@ class ExerciseSessionScreen(Screen):
         if self._recording_path and os.path.exists(self._recording_path):
             return self._recording_path
         return None
+
+    def _close_session_logger(self, summary=None):
+        """Acik oturum kaydini kapatir. Kayit hatasi seansi dusurmez."""
+        kayit = self._session_logger
+        if kayit is None:
+            return None
+        self._session_logger = None
+        try:
+            return kayit.close(summary)
+        except Exception as exc:
+            print(f'[SessionLogger] oturum kapatilamadi: {exc}')
+            return None
+
+    def _log_new_reps(self):
+        """error_history'ye yeni dusen tekrar kararlarini yazar."""
+        if self._session_logger is None:
+            return
+        history = list(self.pose_engine.error_history)
+        if len(history) > self._seen_history:
+            yeni = history[self._seen_history:]
+        elif (
+            len(history) >= 100
+            and self._seen_history >= len(history)
+            and history
+            and history[-1] is not self._seen_tail
+        ):
+            yeni = [history[-1]]
+        else:
+            yeni = []
+        for entry in yeni:
+            karar = 'sayildi' if entry.get('correct') else 'reddedildi'
+            self._session_logger.log_rep(
+                karar,
+                entry.get('reason') or '',
+                entry.get('joint') or '',
+                entry.get('quality'),
+            )
+        self._seen_history = len(history)
+        if history:
+            self._seen_tail = history[-1]
     
     def _update_frame(self, dt):
         if self._auto_finishing or self._session_closed:
@@ -645,9 +754,10 @@ class ExerciseSessionScreen(Screen):
             return
         
         ret, frame = self.camera.read()
-        if not ret:
+        if not ret or frame is None:
             self._set_status('Kare alinamadi, kamerayi kontrol edin', 'warning')
             return
+        frame = np.array(frame, dtype=np.uint8, copy=True)
 
         # Detect common DroidCam decode issue (solid green frames) and auto-fallback.
         if self._is_likely_green_frame(frame):
@@ -659,11 +769,20 @@ class ExerciseSessionScreen(Screen):
                 self._using_droidcam = False
             return
         self._green_frame_count = 0
+        try:
+            if self._session_logger is not None:
+                self._session_logger.write_raw_frame(frame)
+        except Exception as exc:
+            print(f'[SessionLogger] ham kare yazilamadi: {exc}')
         frame = preprocess_frame(frame)
         
         # Pose analizi
         annotated, similarity, feedback, rep_count, joint_status = \
             self.pose_engine.process_frame(frame)
+        try:
+            self._log_new_reps()
+        except Exception as exc:
+            print(f'[SessionLogger] tekrar yazilamadi: {exc}')
         
         # Kamera görüntüsünü güncelle
         self._frame_to_texture(annotated)
@@ -694,17 +813,7 @@ class ExerciseSessionScreen(Screen):
             self._auto_finish_event = Clock.schedule_once(lambda _dt: self._finish_session(), 1.5)
     
     def _frame_to_texture(self, frame_bgr):
-        """OpenCV frame'ini Kivy texture'a dönüştür"""
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frame_flipped = cv2.flip(frame_rgb, 0)
-        
-        buf = frame_flipped.tobytes()
-        texture = Texture.create(
-            size=(frame_bgr.shape[1], frame_bgr.shape[0]),
-            colorfmt='rgb'
-        )
-        texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
-        self.cam_image.texture = texture
+        self.cam_image.show_frame(frame_bgr)
 
     def _open_doctor_video_popup(self, *_):
         if not self._doctor_video_source:
@@ -836,11 +945,13 @@ class ExerciseSessionScreen(Screen):
     def _go_back(self):
         if self.is_running:
             self._pause_session()
+        self._close_session_logger()
         self._close_camera()
         self._close_doctor_helper_preview_stream()
         App.get_running_app().switch_screen('patient_dashboard', direction='right')
     
     def cleanup(self):
+        self._close_session_logger()
         self._close_camera()
         self._close_doctor_helper_preview_stream()
         self._close_doctor_video_preview_stream()

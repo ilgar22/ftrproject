@@ -19,3 +19,8 @@ data/cache/
 *.mp4
 *.avi
 *.mov
+
+tez/madde1_ciktilar/
+
+# Hasta oturum kayitlari (ham video, kisisel veri)
+data/oturumlar/
